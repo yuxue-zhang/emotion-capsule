@@ -1420,6 +1420,16 @@ html,body { height:100%; overflow:hidden; font-family:-apple-system,BlinkMacSyst
               <div class="left"><div class="icon" style="background:rgba(99,102,241,.15)">🧪</div><span class="label">AI 智能分类</span></div>
               <div class="toggle" id="toggle-ai"></div>
             </div>
+            <div class="settings-item" onclick="toggleASRKeyInput()">
+              <div class="left"><div class="icon" style="background:rgba(52,211,153,.15)">🎤</div><span class="label">语音识别 Key</span></div>
+              <span class="right" id="asrKeyStatus">未配置 ›</span>
+            </div>
+            <div id="asrKeyInputRow" style="display:none;padding:12px 14px 14px;border-top:1px solid var(--surface3)">
+              <input id="asrKeyInput" type="password" placeholder="粘贴 SiliconFlow API Key" autocomplete="off"
+                style="width:100%;box-sizing:border-box;padding:9px 12px;border-radius:10px;border:1px solid var(--surface3);background:var(--bg);color:var(--text);font-size:13px;outline:none">
+              <div style="font-size:11px;color:var(--text3);margin-top:7px;line-height:1.55">只保存在你本机浏览器，不会上传。留空则用内置 Key——线上分享版内置 Key 为空，需要自行填写。</div>
+              <button class="btn btn-primary" style="margin-top:10px;width:100%" onclick="saveASRKey()">保存</button>
+            </div>
           </div>
         </div>
         <div class="settings-group">
@@ -2567,6 +2577,7 @@ function startChargeHold() {
     ctx: null, analyser: null, source: null, stream: null,
     pressure: 0, fart: fart, gasInterval: null, rafId: null,
     released: false, speechText: '', interimText: '', speechSupported: false,
+    mode: 'web', // 'web' = Web Speech API，'local' = 浏览器内 Whisper
     hasVoice: false, micStarted: false, speechError: null, speaking: false,
     lastVoiceAt: 0, startAt: Date.now(),
     recognitionEnded: false, restartCount: 0,
@@ -2589,6 +2600,7 @@ function startChargeHold() {
       <div class="fart-sound-wave" id="fartSoundWave"></div>
       <div id="chargeLiveText" style="font-size:13px;color:var(--text2);margin-top:6px;min-height:18px;max-height:36px;overflow:hidden;text-align:center;padding:0 8px"></div>
       <div id="chargeMicStatus" style="font-size:12px;color:var(--text3);margin-top:4px;min-height:16px">🎤 正在开启麦克风…</div>
+      <div id="chargeModelStatus" style="font-size:12px;color:var(--text3);margin-top:4px;min-height:16px"></div>
       <div class="btn-group" style="margin-top:12px">
         <button class="btn btn-secondary" style="flex:1" onclick="endChargeHold()">💥 立即爆炸</button>
         <button class="btn btn-ghost" style="flex:1" onclick="cancelCapture()">取消</button>
@@ -2628,18 +2640,19 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
   const cs = _chargeState;
   if (!cs || cs.released) return;
 
-  // 只用 Web Speech API 一个麦克风通道（手机上 getUserMedia 和 SR 不能共存）
+  // 只用一条麦克风通道（getUserMedia 和 Web Speech 在手机上不能共存）
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) {
-    const nsEl = document.getElementById('chargeMicStatus');
-    if (nsEl) nsEl.textContent = '⚠️ 此浏览器不支持语音识别，建议用 Chrome';
+  const forceRecord = state.settings.asrMode === 'record';
+
+  // 设置里强制本地，或浏览器压根没有 SpeechRecognition → 直接走本地识别
+  if (forceRecord || !SR) {
     cs.speechSupported = false;
-    // 纯计时器蓄力兜底
-    _startTimerOnlyCharge(cs, liquid, pLabel, cracks);
+    _runRecordASRCharge(cs, liquid, pLabel, cracks);
     return;
   }
 
   cs.speechSupported = true;
+  cs.mode = 'web';
   try {
     const rec = new SR();
     rec.lang = 'zh-CN';
@@ -2737,11 +2750,20 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
 
     rec.start();
     cs.recognition = rec;
+
+    // 探测窗口：700ms 内没就绪，或报了「服务不可用」类错误 → 切本地识别
+    // 覆盖国内 Android（无 GMS、连不上 Google 服务）和 iOS 的场景
+    setTimeout(() => {
+      if (cs.released || cs.mode === 'local') return;
+      const fatal = ['service-not-allowed', 'not-allowed', 'network', 'audio-capture'];
+      if (!cs.speechActive || (cs.speechError && fatal.indexOf(cs.speechError) >= 0)) {
+        _switchToRecordASR(cs, liquid, pLabel, cracks);
+      }
+    }, 700);
   } catch (e) {
     console.warn('SpeechRecognition start failed:', e);
     cs.speechSupported = false;
-    const micEl = document.getElementById('chargeMicStatus');
-    if (micEl) micEl.textContent = '🎤 语音识别启动失败，纯计时蓄力中…';
+    _switchToRecordASR(cs, liquid, pLabel, cracks);
   }
 
   // 计时器驱动气压（不依赖 getUserMedia）
@@ -2848,12 +2870,184 @@ function _startTimerOnlyCharge(cs, liquid, pLabel, cracks) {
   cs.rafId = requestAnimationFrame(tick);
 }
 
+/* ========== 录音识别通道（绕开 Chrome 云端语音）==========
+ * Web Speech API 要把音频送到 Google 服务器，国内 Android（无 GMS / 网络不通）
+ * 和 iOS 基本都不可用。这条通道改为：浏览器自己录音 → 交给识别服务转文字。
+ * 录音复用 recordVoice：音量驱动气压、说完停顿自动结束、松手立即结束。
+ */
+const ASR_URL = 'https://api.siliconflow.cn/v1/audio/transcriptions';
+const ASR_MODEL = 'FunAudioLLM/SenseVoiceSmall';
+
+// 优先用用户在设置里填的 Key，没有则用内置 Key（分享版内置 Key 为空）
+function getASRKey() {
+  const custom = ((state.settings && state.settings.asrApiKey) || '').trim();
+  if (custom) return custom;
+  return (typeof AI_CONFIG !== 'undefined' && AI_CONFIG.apiKey) || '';
+}
+
+// Float32Array(16k) → WAV Blob，用于上传
+function encodeWavBlob(samples, sampleRate) {
+  const n = samples.length;
+  const view = new DataView(new ArrayBuffer(44 + n * 2));
+  const put = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+  put(0, 'RIFF'); view.setUint32(4, 36 + n * 2, true); put(8, 'WAVE');
+  put(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  put(36, 'data'); view.setUint32(40, n * 2, true);
+  let off = 44;
+  for (let i = 0; i < n; i++, off += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i] || 0));
+    view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([view.buffer], { type: 'audio/wav' });
+}
+
+async function transcribeAudio(float32, sampleRate) {
+  const key = getASRKey();
+  if (!key) throw new Error('no-asr-key');
+  const form = new FormData();
+  form.append('file', encodeWavBlob(float32, sampleRate || 16000), 'voice.wav');
+  form.append('model', ASR_MODEL);
+  const res = await fetch(ASR_URL, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + key },
+    body: form,
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error('ASR HTTP ' + res.status + ' ' + t.slice(0, 120));
+  }
+  const j = await res.json();
+  return ((j && j.text) || '').trim();
+}
+
+function _switchToRecordASR(cs, liquid, pLabel, cracks) {
+  if (!cs || cs.released || cs.mode === 'local') return;
+  cs.mode = 'local';
+  // 必须先释放 Web Speech 的麦克风通道，否则 getUserMedia 拿不到设备
+  if (cs.recognition) {
+    try {
+      cs.recognition.onstart = null;
+      cs.recognition.onresult = null;
+      cs.recognition.onerror = null;
+      cs.recognition.onend = null;
+      cs.recognition.stop();
+    } catch (e) {}
+    cs.recognition = null;
+  }
+  if (cs.rafId) { cancelAnimationFrame(cs.rafId); cs.rafId = null; }
+  const micEl = document.getElementById('chargeMicStatus');
+  if (micEl) micEl.textContent = '🎤 切换本地录音…';
+  _runRecordASRCharge(cs, liquid, pLabel, cracks);
+}
+
+async function _runRecordASRCharge(cs, liquid, pLabel, cracks) {
+  cs.mode = 'local';
+  try {
+    if (!getASRKey()) {
+      showToast('还没配置语音识别 Key');
+      showFailState('需要在「我的」页填写语音识别 Key');
+      return;
+    }
+
+    const micEl = document.getElementById('chargeMicStatus');
+    if (micEl) micEl.textContent = '🎤 说完停一下就自动发射';
+
+    // 录音：音量驱动气压（仅视觉），说完停顿 1.8 秒自动结束，松手也立即结束
+    const rec = await recordVoice(30, {
+      charge: true,
+      onTick: (info) => {
+        if (!cs || cs.released) return;
+        cs.hasVoice = info.hasVoice;
+        if (info.hasVoice) cs.lastVoiceAt = Date.now();
+        const pct = Math.min(100, info.pressure);
+        const timerEl = document.getElementById('fartTimer');
+        const fillEl = document.getElementById('fartChargeFill');
+        if (timerEl) timerEl.textContent = Math.floor(pct) + '%';
+        if (fillEl) fillEl.style.width = pct + '%';
+        if (liquid) liquid.style.height = pct + '%';
+        if (pLabel) {
+          if (pct < 30) pLabel.textContent = '憋着…';
+          else if (pct < 60) pLabel.textContent = '快了…';
+          else if (pct < 80) pLabel.textContent = '憋不住！';
+          else pLabel.textContent = '💥要炸！';
+        }
+        if (pct >= 70 && cracks) cracks.classList.add('active');
+        const wave = document.getElementById('fartSoundWave');
+        if (wave) wave.querySelectorAll('.fart-sound-bar').forEach((b) => {
+          b.style.setProperty('--bar-h', (6 + info.loud * 30) + 'px');
+        });
+      },
+    });
+
+    if (!rec || rec.cancelled) { resetToCapture(); return; }
+
+    state._chargeHasVoice = !!rec.hasVoice;
+    if (!rec.hasVoice || !rec.audio || rec.audio.length < 1600) {
+      showToast('没听到声音，可用手动装填');
+      showFailState('没听到声音，可以再说一次');
+      return;
+    }
+
+    releaseFart({ skipWait: true });
+    updateASRStatusUI('🧪 识别中…', '约 1-2 秒');
+    const text = await transcribeAudio(rec.audio, 16000);
+    state._chargeText = text;
+    recognizeSpeech(text);
+  } catch (e) {
+    console.warn('录音识别失败:', e);
+    if (cs.released) return;
+    const msg = (e && e.message === 'no-asr-key')
+      ? '还没配置语音识别 Key，可在「我的」页填写'
+      : '识别失败，请检查网络后重试';
+    showToast(msg);
+    showFailState(msg);
+  }
+}
+
+/* ========== 语音识别 Key 设置 ========== */
+function toggleASRKeyInput() {
+  const row = document.getElementById('asrKeyInputRow');
+  if (!row) return;
+  const show = row.style.display === 'none';
+  row.style.display = show ? 'block' : 'none';
+  if (show) {
+    const inp = document.getElementById('asrKeyInput');
+    if (inp) inp.value = (state.settings && state.settings.asrApiKey) || '';
+  }
+}
+
+function saveASRKey() {
+  const inp = document.getElementById('asrKeyInput');
+  const v = ((inp && inp.value) || '').trim();
+  state.settings.asrApiKey = v;
+  saveState();
+  refreshASRKeyStatus();
+  const row = document.getElementById('asrKeyInputRow');
+  if (row) row.style.display = 'none';
+  showToast(v ? '已保存语音识别 Key' : '已清空，将使用内置 Key');
+}
+
+function refreshASRKeyStatus() {
+  const el = document.getElementById('asrKeyStatus');
+  if (!el) return;
+  const custom = ((state.settings && state.settings.asrApiKey) || '').trim();
+  el.textContent = custom ? '已配置 ›' : (getASRKey() ? '内置 ›' : '未配置 ›');
+}
+
 function endChargeHold() {
   const cs = _chargeState;
   if (!cs || cs.released) return;
   cs.released = true;
   if (cs.rafId) cancelAnimationFrame(cs.rafId);
   clearInterval(cs.gasInterval);
+
+  // 本地识别模式：收尾录音，后续由 _runRecordASRCharge 的 await 接着走
+  if (cs.mode === 'local') {
+    if (window.__finishRec) window.__finishRec();
+    return;
+  }
 
   // 停语音识别——final 结果在 stop() 后异步触发
   if (cs.recognition) {
@@ -2904,7 +3098,8 @@ function spawnFartGas(color) {
   state._gasInterval = gasInterval;
 }
 
-function releaseFart() {
+function releaseFart(opts) {
+  const skipWait = !!(opts && opts.skipWait);
   clearInterval(state._gasInterval);
   playSound('charge_stop');
   // Reset pressure gauge
@@ -2985,6 +3180,9 @@ function releaseFart() {
   setTimeout(() => {
     overlay.classList.remove('show');
   }, 1000);
+
+  // 本地识别模式没有 Web Speech 的 final 等待，音频已在手，直接进入识别
+  if (skipWait) return;
 
   // 松手后等 final 文本落地。
   // 关键：onend 到了也要再给 600ms 缓冲，否则 final 迟到会被判成「没听到声音」
@@ -3147,12 +3345,11 @@ function recordVoice(maxSec = 20, opts = {}) {
       const elapsed = (Date.now() - startTime) / 1000;
 
       if (charge) {
-        // 语音蓄力：声音越大气压涨得越快，安静时只有缓慢环境涨
+        // 语音蓄力：气压只做视觉指示，结束完全由「说完/超时」决定，不因气压满而中断
         const dt = e.inputBuffer.duration || 0.1;
         const loud = Math.min(1, rms / 0.25);
-        pressure += rms > 0.015 ? dt * (3 + loud * 20) : dt * 2;
+        pressure += rms > 0.015 ? dt * 14 : dt * 2;
         if (opts.onTick) opts.onTick({ rms, loud, hasVoice, elapsed, pressure: Math.min(100, pressure) });
-        if (pressure >= 100) return finish('full');
       } else {
         const secEl = document.getElementById('recSec');
         if (secEl) secEl.textContent = elapsed.toFixed(1) + 's';
@@ -3625,6 +3822,7 @@ function cancelCapture() {
   if (cs && !cs.released) {
     cs.released = true;
     if (cs.rafId) cancelAnimationFrame(cs.rafId);
+    if (cs.mode === 'local') { if (window.__cancelRec) window.__cancelRec(); }
     if (cs.recognition) { try { cs.recognition.stop(); } catch(e){} }
   }
   resetToCapture();
@@ -5377,6 +5575,7 @@ if (window.DeviceMotionEvent) {
   // 恢复设置开关状态
   if (state.settings.sound === false) document.getElementById('toggle-sound')?.classList.remove('on');
   if (state.settings.vibrate === false) document.getElementById('toggle-vibrate')?.classList.remove('on');
+  refreshASRKeyStatus();
   // 离开页面前尽力落盘
   window.addEventListener('pagehide', () => dbPersistNow());
 })();
