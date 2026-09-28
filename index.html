@@ -2528,13 +2528,26 @@ function _initChargeBtn() {
   const btn = document.getElementById('chargeBtn');
   if (!btn || btn._bound) return;
   btn._bound = true;
-  // pointerdown = 开始蓄力，pointerup/pointerleave/pointercancel = 松手爆炸
-  btn.addEventListener('pointerdown', (e) => { e.preventDefault(); startChargeHold(); });
+
+  // pointerdown 开始蓄力，用 setPointerCapture 锁定指针
+  // 这样手指滑动也不会触发 pointerleave，只有真正松手才 pointerup
+  btn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    try { btn.setPointerCapture(e.pointerId); } catch(err) {}
+    startChargeHold();
+  });
   btn.addEventListener('pointerup', () => endChargeHold());
-  btn.addEventListener('pointerleave', () => endChargeHold());
   btn.addEventListener('pointercancel', () => endChargeHold());
+  // 不再监听 pointerleave——手机上手指微移就触发，导致提前爆炸
+
   // 防止手机长按弹出上下文菜单
   btn.addEventListener('contextmenu', (e) => e.preventDefault());
+  // 防止触摸触发选中/滚动
+  btn.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false });
+  btn.style.touchAction = 'none';
+  btn.style.userSelect = 'none';
+  btn.style.webkitUserSelect = 'none';
+  btn.style.WebkitUserSelect = 'none';
 }
 
 function startChargeHold() {
@@ -2689,6 +2702,21 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
       if (!cs.speechText && cs.interimText) {
         cs.speechText = cs.interimText.trim();
       }
+      // 如果还在蓄力中（用户没松手），自动重启识别
+      // Web Speech API 会在停顿时自动 stop，不重启后续说话全丢
+      if (!cs.released) {
+        cs.interimText = ''; // 重置 interim，避免重复
+        setTimeout(() => {
+          if (!cs.released && cs.recognition) {
+            try {
+              cs.recognition.start();
+              cs.recognitionEnded = false;
+            } catch (e) {
+              console.warn('SpeechRecognition restart failed:', e);
+            }
+          }
+        }, 100);
+      }
     };
 
     rec.start();
@@ -2708,7 +2736,8 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
     const dt = 0.05;
 
     // 说话时气压涨得快，没说话时缓慢涨
-    cs.pressure += cs.speaking ? dt * 18 : dt * 4;
+    // 说话时 ~6秒蓄满（给用户时间说完话），没说话时 ~25秒保底
+    cs.pressure += cs.speaking ? dt * 5.5 : dt * 1.5;
     const pct = Math.min(100, cs.pressure);
 
     // 更新 UI
@@ -2791,7 +2820,7 @@ function endChargeHold() {
     return;
   }
 
-  // 先走爆炸动画，1.5 秒后取最终文本（等 onend 写入 final）
+  // 爆炸动画，等 onend 写入最终文本后再走分析
   releaseFart();
 }
 
@@ -2900,14 +2929,21 @@ function releaseFart() {
     overlay.classList.remove('show');
   }, 1000);
 
-  setTimeout(() => {
-    // 从 _chargeState 取最新文本（onend 可能刚把 final 写入）
+  // 轮询等待 onend 把最终文本写入 _chargeState（最多等 3 秒）
+  const waitAndRecognize = () => {
     const cs = _chargeState;
-    let text = (cs && cs.speechText || '').trim();
-    if (!text && cs && cs.interimText) text = cs.interimText.trim();
-    state._chargeText = text;
-    recognizeSpeech(text);
-  }, 1500);
+    // onend 已触发，或已有 final 文本，或等够 3 秒
+    if (!cs || cs.recognitionEnded || cs.speechText || (Date.now() - waitStart) >= 3000) {
+      let text = (cs && cs.speechText || '').trim();
+      if (!text && cs && cs.interimText) text = cs.interimText.trim();
+      state._chargeText = text;
+      recognizeSpeech(text);
+    } else {
+      setTimeout(waitAndRecognize, 200);
+    }
+  };
+  const waitStart = Date.now();
+  setTimeout(waitAndRecognize, 500);
 }
 
 /* ========== 本地语音识别 (Whisper on-device via transformers.js) ========== */
