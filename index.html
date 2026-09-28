@@ -2560,9 +2560,27 @@ function _initChargeBtn() {
   btn.style.WebkitUserSelect = 'none';
 }
 
+// iOS / 部分安卓要求 AudioContext 在「用户手势的同步调用栈」里创建并 resume。
+// 一旦 await 过 getUserMedia，手势上下文就没了，之后新建的 ctx 会停在 suspended，
+// onaudioprocess 一帧都不回调 —— 表现就是「权限点允许了，却完全听不到」。
+// 所以在按住按钮的瞬间先预热一个，后面录音直接复用。
+function _primeAudioContext() {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    if (!window.__audioCtx || window.__audioCtx.state === 'closed') {
+      try { window.__audioCtx = new AC({ sampleRate: 16000 }); }
+      catch (e) { window.__audioCtx = new AC(); }
+    }
+    if (window.__audioCtx.state === 'suspended') window.__audioCtx.resume();
+    return window.__audioCtx;
+  } catch (e) { return null; }
+}
+
 function startChargeHold() {
   if (state.captureState !== 'idle') return;
   playSound('click');
+  _primeAudioContext(); // 必须在手势的同步栈里，不能放到 await 之后
   state.captureState = 'charging';
 
   const machine = document.getElementById('capsuleMachine');
@@ -2712,8 +2730,18 @@ async function _runRecordASRCharge(cs, liquid, pLabel, cracks) {
     // 录音：音量驱动气压（仅视觉），说完停顿 1.8 秒自动结束，松手也立即结束
     const rec = await recordVoice(30, {
       charge: true,
+      onReady: () => {
+        // 拿到麦克风了，明确告诉用户，方便区分「没授权」和「授权了但没声音」
+        const el = document.getElementById('chargeMicStatus');
+        if (el) el.textContent = '🎤 麦克风已开 · 说完停一下就自动发射';
+      },
       onTick: (info) => {
         if (!cs || cs.released) return;
+        if (info.hasVoice && !cs._heardOnce) {
+          cs._heardOnce = true;
+          const el = document.getElementById('chargeMicStatus');
+          if (el) el.textContent = '🎤 听到你了 · 说完停一下就自动发射';
+        }
         cs.hasVoice = info.hasVoice;
         if (info.hasVoice) cs.lastVoiceAt = Date.now();
         const pct = Math.min(100, info.pressure);
@@ -2756,6 +2784,8 @@ async function _runRecordASRCharge(cs, liquid, pLabel, cracks) {
     let msg = '识别失败，请检查网络后重试';
     if (e && (e.message === 'mic' || e.message === 'unsupported')) {
       msg = '麦克风打不开。请允许麦克风权限；在微信里打开的话，点右上角「···」用浏览器打开';
+    } else if (e && e.message === 'no-audio') {
+      msg = '麦克风已授权，但收不到声音。请退出重进页面再试一次';
     } else if (e && e.message === 'no-asr-key') {
       msg = '语音识别未配置，可用手动装填';
     }
@@ -2945,7 +2975,7 @@ function recordVoice(maxSec = 20, opts = {}) {
     const charge = !!opts.charge;
     let stream, ctx, processor, source, mute;
     let chunks = [], hasVoice = false, lastVoiceAt = 0, startTime = 0, stopped = false;
-    let pressure = 0, cancelled = false;
+    let pressure = 0, cancelled = false, frames = 0;
 
     const cleanup = () => {
       stopped = true;
@@ -2984,8 +3014,11 @@ function recordVoice(maxSec = 20, opts = {}) {
       reject(new Error('mic'));
       return;
     }
-    try { ctx = new AC({ sampleRate: 16000 }); }
-    catch (e) { ctx = new AC(); }
+    // 复用手势阶段预热好的 AudioContext。
+    // iOS / 部分安卓上，await getUserMedia 之后再 new AudioContext() 会停在 suspended，
+    // onaudioprocess 一帧都不回调 —— 表现就是「权限给了，但完全听不到」
+    if (window.__audioCtx && window.__audioCtx.state !== 'closed') ctx = window.__audioCtx;
+    else { try { ctx = new AC({ sampleRate: 16000 }); } catch (e) { ctx = new AC(); } }
 
     source = ctx.createMediaStreamSource(stream);
     processor = ctx.createScriptProcessor(4096, 1, 1);
@@ -2997,9 +3030,17 @@ function recordVoice(maxSec = 20, opts = {}) {
     startTime = Date.now();
     if (ctx.state === 'suspended') ctx.resume();
     if (!charge) renderRecUIStatic();
+    if (opts.onReady) opts.onReady();
+
+    // 兜底：授权了但音频图没跑起来的机型，补一次 resume；再不行就明确报错，别让用户干等
+    setTimeout(() => { if (!stopped && frames === 0) { try { ctx.resume(); } catch (e) {} } }, 800);
+    setTimeout(() => {
+      if (!stopped && frames === 0) { cleanup(); reject(new Error('no-audio')); }
+    }, 2600);
 
     processor.onaudioprocess = (e) => {
       if (stopped) return;
+      frames++;
       const data = e.inputBuffer.getChannelData(0);
       chunks.push(new Float32Array(data));
       let sum = 0;
