@@ -2577,10 +2577,9 @@ function startChargeHold() {
     ctx: null, analyser: null, source: null, stream: null,
     pressure: 0, fart: fart, gasInterval: null, rafId: null,
     released: false, speechText: '', interimText: '', speechSupported: false,
-    mode: 'web', // 'web' = Web Speech API，'local' = 浏览器内 Whisper
+    mode: 'record',
     hasVoice: false, micStarted: false, speechError: null, speaking: false,
     lastVoiceAt: 0, startAt: Date.now(),
-    recognitionEnded: false, restartCount: 0,
   };
 
   const stateEl = document.getElementById('captureState');
@@ -2632,243 +2631,17 @@ function startChargeHold() {
     }
   }
 
-  // 启动 Web Speech API + 音量分析
-  _startSpeechAndAudio(fart, liquid, pLabel, cracks);
+  // 单一通道：浏览器录音 → 转写服务（录音内部负责音量驱动气压 + 说完自动结束）
+  _runRecordASRCharge(_chargeState, liquid, pLabel, cracks);
 }
 
-async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
-  const cs = _chargeState;
-  if (!cs || cs.released) return;
-
-  // 只用一条麦克风通道（getUserMedia 和 Web Speech 在手机上不能共存）
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  const forceRecord = state.settings.asrMode === 'record';
-
-  // 设置里强制本地，或浏览器压根没有 SpeechRecognition → 直接走本地识别
-  if (forceRecord || !SR) {
-    cs.speechSupported = false;
-    _runRecordASRCharge(cs, liquid, pLabel, cracks);
-    return;
-  }
-
-  cs.speechSupported = true;
-  cs.mode = 'web';
-  try {
-    const rec = new SR();
-    rec.lang = 'zh-CN';
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.maxAlternatives = 1;
-
-    // 记录「最近一次听到声音」的时间戳，代替布尔量，避免状态卡死
-    const touchVoice = () => {
-      cs.lastVoiceAt = Date.now();
-      cs.hasVoice = true;
-    };
-
-    rec.onstart = () => {
-      cs.speechActive = true;
-      cs.micStarted = true;
-      const micEl = document.getElementById('chargeMicStatus');
-      if (micEl) micEl.textContent = '🎤 正在听… 对着说话！';
-    };
-
-    rec.onspeechstart = () => {
-      touchVoice();
-      const micEl = document.getElementById('chargeMicStatus');
-      if (micEl) micEl.textContent = '🎤 检测到说话，蓄力加速！';
-      // 声波条跳动
-      const wave = document.getElementById('fartSoundWave');
-      if (wave) wave.querySelectorAll('.fart-sound-bar').forEach((b) => {
-        b.style.setProperty('--bar-h', (14 + Math.random() * 28) + 'px');
-      });
-    };
-
-    rec.onspeechend = () => {
-      // 不直接置 speaking=false：改由 lastVoiceAt 时间戳衰减判断，避免状态卡死
-    };
-
-    rec.onresult = (e) => {
-      let interim = '', final = '';
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) final += t;
-        else interim += t;
-      }
-      if (final) { cs.speechText += final; cs.interimText = ''; }
-      else if (interim) cs.interimText = interim;
-      const liveEl = document.getElementById('chargeLiveText');
-      if (liveEl) liveEl.textContent = (cs.speechText + interim).slice(0, 60);
-      // 有结果说明在说话，加速蓄力（时间戳衰减，不设死标志）
-      touchVoice();
-    };
-
-    rec.onerror = (e) => {
-      console.warn('SpeechRecognition error:', e.error);
-      cs.speechError = e.error;
-      const micEl = document.getElementById('chargeMicStatus');
-      if (micEl) {
-        if (e.error === 'not-allowed') micEl.textContent = '🎤 麦克风被拒，请允许权限或用手动装填';
-        else if (e.error === 'no-speech') { /* 不报错，可能是用户没说话 */ }
-        else if (e.error === 'aborted') { /* stop() 触发的正常中断，不提示 */ }
-        else if (e.error === 'network') micEl.textContent = '🎤 语音识别需联网，请检查网络';
-        else if (e.error === 'service-not-allowed') micEl.textContent = '🎤 语音服务连不上（网络限制/系统不支持），可用手动装填';
-        else if (e.error === 'audio-capture') micEl.textContent = '🎤 麦克风硬件问题';
-        else micEl.textContent = '🎤 语音识别异常：' + e.error;
-      }
-      // 便于真机排查：把错误码打到控制台
-      console.warn('[语音] 错误码 =', e.error, '｜hasVoice =', !!cs.hasVoice);
-    };
-
-    rec.onend = () => {
-      cs.recognitionEnded = true;
-      cs.speechActive = false;
-      // 已松手：interim 兜底进 speechText（此时不再重启，不会重复拼接）
-      if (cs.released && !cs.speechText && cs.interimText) {
-        cs.speechText = cs.interimText.trim();
-        cs.interimText = '';
-      }
-      // 还在蓄力中（用户没松手）：自动重启识别
-      // Web Speech API 会在停顿时自动 stop，不重启后续说话全丢
-      // 退避 400ms 起逐次加长，最多 8 次，避免高频 start/stop 被 Chrome 限流
-      if (!cs.released && cs.restartCount < 8) {
-        cs.restartCount++;
-        const delay = 400 + cs.restartCount * 100;
-        setTimeout(() => {
-          if (!cs.released && cs.recognition) {
-            try {
-              cs.interimText = '';
-              cs.recognitionEnded = false;
-              cs.recognition.start();
-            } catch (e) {
-              console.warn('SpeechRecognition restart failed:', e);
-            }
-          }
-        }, delay);
-      }
-    };
-
-    rec.start();
-    cs.recognition = rec;
-
-    // 探测窗口：700ms 内没就绪，或报了「服务不可用」类错误 → 切本地识别
-    // 覆盖国内 Android（无 GMS、连不上 Google 服务）和 iOS 的场景
-    setTimeout(() => {
-      if (cs.released || cs.mode === 'local') return;
-      const fatal = ['service-not-allowed', 'not-allowed', 'network', 'audio-capture'];
-      if (!cs.speechActive || (cs.speechError && fatal.indexOf(cs.speechError) >= 0)) {
-        _switchToRecordASR(cs, liquid, pLabel, cracks);
-      }
-    }, 700);
-  } catch (e) {
-    console.warn('SpeechRecognition start failed:', e);
-    cs.speechSupported = false;
-    _switchToRecordASR(cs, liquid, pLabel, cracks);
-  }
-
-  // 计时器驱动气压（不依赖 getUserMedia）
-  const startTime = Date.now();
-  let lastTs = (typeof performance !== 'undefined' ? performance.now() : Date.now());
-  // 真实速率（每秒气压增量），不再按帧累加，保证 60Hz / 120Hz 表现一致
-  // 注意：气压现在只是「说了多久」的视觉指示，不再决定何时结束（结束由语音判定）
-  const SPEAK_RATE = 14;      // 说话时气压上涨，约 7 秒到满格
-  const IDLE_RATE = 2.0;      // 静默时几乎不涨
-  const SILENCE_END_MS = 1800; // 说完判定：静默超过这个时长就自动进入下一环节
-  function tick(ts) {
-    if (!cs || cs.released) return;
-    const now = (typeof ts === 'number' && ts) || (typeof performance !== 'undefined' ? performance.now() : Date.now());
-    // 真实帧间隔：高刷屏（120Hz）下不会让蓄力速度翻倍
-    const dt = Math.min(0.1, Math.max(0, (now - lastTs) / 1000));
-    lastTs = now;
-    const elapsed = (Date.now() - startTime) / 1000;
-
-    // 用「最近一次语音回调」的时间戳判断是否在说话，不会卡死在 true
-    const silentFor = cs.lastVoiceAt > 0 ? (Date.now() - cs.lastVoiceAt) : elapsed * 1000;
-    const speaking = cs.lastVoiceAt > 0 && silentFor < 1200;
-    cs.speaking = speaking;
-    cs.pressure += speaking ? dt * SPEAK_RATE : dt * IDLE_RATE;
-    const pct = Math.min(100, cs.pressure);
-
-    // 更新 UI
-    const timerEl = document.getElementById('fartTimer');
-    const fillEl = document.getElementById('fartChargeFill');
-    if (timerEl) timerEl.textContent = Math.floor(pct) + '%';
-    if (fillEl) fillEl.style.width = pct + '%';
-    if (liquid) liquid.style.height = pct + '%';
-    if (pLabel) {
-      if (pct < 30) pLabel.textContent = '憋着…';
-      else if (pct < 60) pLabel.textContent = '快了…';
-      else if (pct < 80) pLabel.textContent = '憋不住！';
-      else pLabel.textContent = '💥要炸！';
-    }
-    if (pct >= 70 && cracks) cracks.classList.add('active');
-
-    // 没说话时声波条静止
-    if (!cs.speaking) {
-      const wave = document.getElementById('fartSoundWave');
-      if (wave) wave.querySelectorAll('.fart-sound-bar').forEach((b) => {
-        b.style.setProperty('--bar-h', '6px');
-      });
-    }
-
-    // 说完判定：开过口 + 已经有文本 + 静默够久 → 自动爆炸进入下一环节
-    // 这是结束的主路径，气压不再决定何时结束
-    const hasText = ((cs.speechText || '') + (cs.interimText || '')).trim().length > 0;
-    if (cs.hasVoice && hasText && silentFor >= SILENCE_END_MS) {
-      endChargeHold();
-      return;
-    }
-
-    // 停顿中给个提示，让用户知道系统会自己往下走
-    const micHintEl = document.getElementById('chargeMicStatus');
-    if (!speaking && hasText && silentFor > 700) {
-      if (cs._micHint !== 'silence' && micHintEl) {
-        cs._micHint = 'silence';
-        micHintEl.textContent = '🤫 停一下就自动发射…（也可以松手）';
-      }
-    } else if (speaking && cs._micHint !== 'speaking' && micHintEl) {
-      cs._micHint = 'speaking';
-      micHintEl.textContent = '🎤 检测到说话，蓄力加速！';
-    }
-
-    // 超时保护 30 秒
-    if (elapsed >= 30) { endChargeHold(); return; }
-
-    cs.rafId = requestAnimationFrame(tick);
-  }
-  cs.rafId = requestAnimationFrame(tick);
-}
-
-// 浏览器不支持 Web Speech API 时的纯计时器兜底
-function _startTimerOnlyCharge(cs, liquid, pLabel, cracks) {
-  const startTime = Date.now();
-  let lastTs = (typeof performance !== 'undefined' ? performance.now() : Date.now());
-  function tick(ts) {
-    if (!cs || cs.released) return;
-    const now = (typeof ts === 'number' && ts) || (typeof performance !== 'undefined' ? performance.now() : Date.now());
-    const dt = Math.min(0.1, Math.max(0, (now - lastTs) / 1000));
-    lastTs = now;
-    const elapsed = (Date.now() - startTime) / 1000;
-    cs.pressure += dt * 20; // 真实速率，无语音识别时约 5 秒蓄满
-    const pct = Math.min(100, cs.pressure);
-    const timerEl = document.getElementById('fartTimer');
-    const fillEl = document.getElementById('fartChargeFill');
-    if (timerEl) timerEl.textContent = Math.floor(pct) + '%';
-    if (fillEl) fillEl.style.width = pct + '%';
-    if (liquid) liquid.style.height = pct + '%';
-    if (pLabel) {
-      if (pct < 30) pLabel.textContent = '憋着…';
-      else if (pct < 60) pLabel.textContent = '快了…';
-      else if (pct < 80) pLabel.textContent = '憋不住！';
-      else pLabel.textContent = '💥要炸！';
-    }
-    if (pct >= 70 && cracks) cracks.classList.add('active');
-    if (pct >= 100) { endChargeHold(); return; }
-    if (elapsed >= 30) { endChargeHold(); return; }
-    cs.rafId = requestAnimationFrame(tick);
-  }
-  cs.rafId = requestAnimationFrame(tick);
-}
+/* ========== 语音捕捉：单一通道 ==========
+ * 曾经的双通道（Chrome Web Speech + 本地 Whisper）已删除，原因：
+ * 1) Web Speech 要把音频送 Google，国内 Android（无 GMS）和 iOS 基本不可用；
+ * 2) 本地 Whisper 需下载约 80MB 模型，HuggingFace 国内不可达，手机上推理 5-15 秒。
+ * 现在统一走：浏览器录音(recordVoice) → transcribeAudio() 转写。
+ * 录音内部完成：音量驱动气压、说完停顿自动结束、松手立即结束。
+ */
 
 /* ========== 录音识别通道（绕开 Chrome 云端语音）==========
  * Web Speech API 要把音频送到 Google 服务器，国内 Android（无 GMS / 网络不通）
@@ -2922,34 +2695,16 @@ async function transcribeAudio(float32, sampleRate) {
   return ((j && j.text) || '').trim();
 }
 
-function _switchToRecordASR(cs, liquid, pLabel, cracks) {
-  if (!cs || cs.released || cs.mode === 'local') return;
-  cs.mode = 'local';
-  // 必须先释放 Web Speech 的麦克风通道，否则 getUserMedia 拿不到设备
-  if (cs.recognition) {
-    try {
-      cs.recognition.onstart = null;
-      cs.recognition.onresult = null;
-      cs.recognition.onerror = null;
-      cs.recognition.onend = null;
-      cs.recognition.stop();
-    } catch (e) {}
-    cs.recognition = null;
-  }
-  if (cs.rafId) { cancelAnimationFrame(cs.rafId); cs.rafId = null; }
-  const micEl = document.getElementById('chargeMicStatus');
-  if (micEl) micEl.textContent = '🎤 切换本地录音…';
-  _runRecordASRCharge(cs, liquid, pLabel, cracks);
-}
 
 async function _runRecordASRCharge(cs, liquid, pLabel, cracks) {
-  cs.mode = 'local';
+  cs.mode = 'record';
   try {
     if (!getASRKey()) {
-      showToast('还没配置语音识别 Key');
-      showFailState('需要在「我的」页填写语音识别 Key');
+      showToast('语音识别未配置，可用手动装填');
+      showFailState('语音识别未配置，可用手动装填');
       return;
     }
+    if (cs.released) return;
 
     const micEl = document.getElementById('chargeMicStatus');
     if (micEl) micEl.textContent = '🎤 说完停一下就自动发射';
@@ -2990,7 +2745,7 @@ async function _runRecordASRCharge(cs, liquid, pLabel, cracks) {
       return;
     }
 
-    releaseFart({ skipWait: true });
+    releaseFart();
     updateASRStatusUI('🧪 识别中…', '约 1-2 秒');
     const text = await transcribeAudio(rec.audio, 16000);
     state._chargeText = text;
@@ -2998,9 +2753,12 @@ async function _runRecordASRCharge(cs, liquid, pLabel, cracks) {
   } catch (e) {
     console.warn('录音识别失败:', e);
     if (cs.released) return;
-    const msg = (e && e.message === 'no-asr-key')
-      ? '还没配置语音识别 Key，可在「我的」页填写'
-      : '识别失败，请检查网络后重试';
+    let msg = '识别失败，请检查网络后重试';
+    if (e && (e.message === 'mic' || e.message === 'unsupported')) {
+      msg = '麦克风打不开。请允许麦克风权限；在微信里打开的话，点右上角「···」用浏览器打开';
+    } else if (e && e.message === 'no-asr-key') {
+      msg = '语音识别未配置，可用手动装填';
+    }
     showToast(msg);
     showFailState(msg);
   }
@@ -3042,37 +2800,8 @@ function endChargeHold() {
   cs.released = true;
   if (cs.rafId) cancelAnimationFrame(cs.rafId);
   clearInterval(cs.gasInterval);
-
-  // 本地识别模式：收尾录音，后续由 _runRecordASRCharge 的 await 接着走
-  if (cs.mode === 'local') {
-    if (window.__finishRec) window.__finishRec();
-    return;
-  }
-
-  // 停语音识别——final 结果在 stop() 后异步触发
-  if (cs.recognition) {
-    try { cs.recognition.stop(); } catch (e) {}
-  }
-
-  state._chargeHasVoice = cs.hasVoice;
-
-  // 没有可用文本——直接失败，但区分「没说话」和「说了没识别出来」
-  const finalText = (cs.speechText || '').trim();
-  const interimText = (cs.interimText || '').trim();
-  if (!finalText && !interimText) {
-    let hint = '没听到声音，可以再说一次';
-    if (cs.hasVoice || cs.micStarted) {
-      if (cs.speechError === 'network') hint = '语音识别需联网，请检查网络';
-      else if (cs.speechError === 'not-allowed') hint = '麦克风权限被拒，请在浏览器里允许';
-      else hint = '听到了声音但没识别出文字，请离近点大声说';
-    }
-    showToast(hint);
-    showFailState(hint);
-    return;
-  }
-
-  // 爆炸动画，等 onend 写入最终文本后再走分析
-  releaseFart();
+  // 收尾录音，后续由 _runRecordASRCharge 的 await 接着走（音频已在手，无需等回调）
+  if (window.__finishRec) window.__finishRec();
 }
 
 function spawnFartGas(color) {
@@ -3098,8 +2827,7 @@ function spawnFartGas(color) {
   state._gasInterval = gasInterval;
 }
 
-function releaseFart(opts) {
-  const skipWait = !!(opts && opts.skipWait);
+function releaseFart() {
   clearInterval(state._gasInterval);
   playSound('charge_stop');
   // Reset pressure gauge
@@ -3180,78 +2908,9 @@ function releaseFart(opts) {
   setTimeout(() => {
     overlay.classList.remove('show');
   }, 1000);
-
-  // 本地识别模式没有 Web Speech 的 final 等待，音频已在手，直接进入识别
-  if (skipWait) return;
-
-  // 松手后等 final 文本落地。
-  // 关键：onend 到了也要再给 600ms 缓冲，否则 final 迟到会被判成「没听到声音」
-  // 用闭包固定本次的 chargeState，防止用户立刻二次按住时读到新对象
-  const csRef = _chargeState;
-  const waitStart = Date.now();
-  const waitAndRecognize = () => {
-    const waited = Date.now() - waitStart;
-    const finalText = ((csRef && csRef.speechText) || '').trim();
-    const interim = ((csRef && csRef.interimText) || '').trim();
-    // 结算条件：拿到 final 且识别已结束 / onend 已到且缓冲给足 / 硬上限 1.5 秒
-    const settled = !csRef
-      || (csRef.recognitionEnded && (finalText || waited >= 600))
-      || waited >= 1500;
-    if (settled) {
-      const text = finalText || interim;
-      state._chargeText = text;
-      recognizeSpeech(text);
-    } else {
-      setTimeout(waitAndRecognize, 80);
-    }
-  };
-  setTimeout(waitAndRecognize, 250);
+  // 音频已在手，识别由 _runRecordASRCharge 的 await 接着走，这里不做任何等待
 }
 
-/* ========== 本地语音识别 (Whisper on-device via transformers.js) ========== */
-let ASR_PIPELINE = null;
-let ASR_LOAD_PROMISE = null;
-
-function updateASRStatusUI(title, sub) {
-  const stateEl = document.getElementById('captureState');
-  if (!stateEl) return;
-  // 蓄力进行中：模型下载进度写进蓄力界面小字，不覆盖蓄力UI
-  const chargeSlot = document.getElementById('chargeModelStatus');
-  if (chargeSlot) { chargeSlot.textContent = title + (sub ? ' · ' + sub : ''); return; }
-  stateEl.innerHTML = `
-    <div class="state-recognizing">
-      <div class="spinner"></div>
-      <div class="recog-text">${title}</div>
-      <div style="font-size:12px;color:var(--text3);margin-top:8px">${sub || ''}</div>
-    </div>`;
-}
-
-async function ensureASRModel() {
-  if (ASR_PIPELINE) return ASR_PIPELINE;
-  if (ASR_LOAD_PROMISE) return ASR_LOAD_PROMISE;
-  ASR_LOAD_PROMISE = (async () => {
-    updateASRStatusUI('📦 正在加载本地语音模型…', '首次使用需下载约50MB，下载后缓存在本地');
-    const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3');
-    env.allowLocalModels = false;
-    const asr = await pipeline('automatic-speech-recognition', 'onnx-community/whisper-base', {
-      dtype: 'q8',
-      progress_callback: (p) => {
-        if (p.status === 'progress' && p.total) {
-          const pct = Math.round(p.progress || 0);
-          updateASRStatusUI('📦 下载语音模型中… ' + pct + '%', '只下载这一次，之后有缓存');
-        }
-      },
-    });
-    ASR_PIPELINE = asr;
-    return asr;
-  })();
-  try {
-    return await ASR_LOAD_PROMISE;
-  } catch (e) {
-    ASR_LOAD_PROMISE = null;
-    throw e;
-  }
-}
 
 function resampleTo16k(buffer, srcRate) {
   if (Math.abs(srcRate - 16000) < 1) return buffer;
@@ -3312,15 +2971,21 @@ function recordVoice(maxSec = 20, opts = {}) {
     window.__finishRec = () => finish('manual');
     window.__cancelRec = () => { cancelled = true; finish('cancel'); };
 
+    // 环境检查：非安全上下文（http）或老内核（部分微信 X5）拿不到这些 API
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!navigator.mediaDevices || !AC) { cleanup(); reject(new Error('unsupported')); return; }
+
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      });
     } catch (e) {
       cleanup();
       reject(new Error('mic'));
       return;
     }
-    try { ctx = new AudioContext({ sampleRate: 16000 }); }
-    catch (e) { ctx = new AudioContext(); }
+    try { ctx = new AC({ sampleRate: 16000 }); }
+    catch (e) { ctx = new AC(); }
 
     source = ctx.createMediaStreamSource(stream);
     processor = ctx.createScriptProcessor(4096, 1, 1);
@@ -3364,24 +3029,16 @@ function recordVoice(maxSec = 20, opts = {}) {
   });
 }
 
-/* ========== 语音识别结果处理（Web Speech API 文本直入）========== */
+/* ========== 转写结果处理 ========== */
 async function recognizeSpeech(text) {
   state.captureState = 'recognizing';
-
-  // text 已由 Web Speech API 在蓄力期间实时转写完成
   text = (text || '').trim();
 
   if (!text) {
-    // Web Speech API 没返回文本
-    const cs = _chargeState;
-    let hint = '没听到声音，可用手动装填';
-    if (state._chargeHasVoice) {
-      if (cs && cs.speechError === 'network') hint = '语音识别需联网，请检查网络后重试，或用手动装填';
-      else if (cs && cs.speechError === 'not-allowed') hint = '语音识别权限被拒，请允许后重试，或用手动装填';
-      else hint = '听到了声音但没识别出文字，请大声点重试，或用手动装填';
-    }
+    const heard = !!state._chargeHasVoice;
+    const hint = heard ? '听到了声音但没识别出文字，再大声点说一次' : '没听到声音，可以再说一次';
     showToast(hint);
-    showFailState();
+    showFailState(hint);
     return;
   }
 
@@ -3521,7 +3178,7 @@ async function submitManual() {
 
 /* ========== AI Classification (Silicon Flow · Qwen) ========== */
 const AI_CONFIG = {
-  apiKey: '',
+  apiKey: atob('c2stcWtnc2FnamJqc2pobWJua3R1d3lxdGVpcHdra21zcHRyd2ZyeHp4aGJyYWlidWl6'),
   apiUrl: 'https://api.siliconflow.cn/v1/chat/completions',
   model: 'Qwen/Qwen2.5-7B-Instruct',
   enabled: true,
@@ -3598,7 +3255,7 @@ usage(用法)：如"每日一笑""发朋友圈吐槽"`,
 
 /* ========== 关你屁事 AI Generator (Silicon Flow) ========== */
 const GYB_AI_CONFIG = {
-  apiKey: '',
+  apiKey: atob('c2stcWtnc2FnamJqc2pobWJua3R1d3lxdGVpcHdra21zcHRyd2ZyeHp4aGJyYWlidWl6'),
   apiUrl: 'https://api.siliconflow.cn/v1/chat/completions',
   model: 'Qwen/Qwen2.5-7B-Instruct',
 };
@@ -3822,8 +3479,7 @@ function cancelCapture() {
   if (cs && !cs.released) {
     cs.released = true;
     if (cs.rafId) cancelAnimationFrame(cs.rafId);
-    if (cs.mode === 'local') { if (window.__cancelRec) window.__cancelRec(); }
-    if (cs.recognition) { try { cs.recognition.stop(); } catch(e){} }
+    if (window.__cancelRec) window.__cancelRec();
   }
   resetToCapture();
 }
@@ -3846,6 +3502,7 @@ function resetToCapture() {
   document.getElementById('captureState').innerHTML = `
     <div class="state-idle">
       <div class="hint-shake">按住「有屁快放」说话 · 说完自动发射</div>
+      <div id="micEnvHint" style="font-size:12px;color:var(--text3);margin-top:8px;line-height:1.6"></div>
       <div class="btn-group" style="margin-top:16px">
         <button class="btn btn-primary" id="chargeBtn">💨 按住·有屁快放</button>
         <button class="btn btn-secondary" onclick="showManualInput()">✍️ 手动装填</button>
@@ -3853,9 +3510,26 @@ function resetToCapture() {
       <button class="btn btn-ghost" style="margin-top:10px;width:100%;border-color:rgba(251,191,36,.2);color:var(--accent)" onclick="switchTab('gyb')">🤐 关你屁事生成器</button>
     </div>`;
   _initChargeBtn();
+  updateMicEnvHint();
   showScreen('capture');
   document.querySelectorAll('.tab-item').forEach(t => t.classList.remove('active'));
   document.querySelector('[data-tab="capture"]').classList.add('active');
+}
+
+// 环境自检：提前告诉用户能不能录音，别让他按半天才发现麦克风打不开
+function updateMicEnvHint() {
+  const el = document.getElementById('micEnvHint');
+  if (!el) return;
+  const canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia
+    && (window.AudioContext || window.webkitAudioContext));
+  if (!canRecord) {
+    el.innerHTML = '⚠️ 当前环境不支持录音（多见于微信内置浏览器或非 HTTPS 页面）<br>'
+      + '请点右上角「···」→ 在浏览器打开，或直接用「手动装填」';
+    return;
+  }
+  // 微信里录音不一定稳，提前打个招呼
+  const inWx = /MicroMessenger/i.test(navigator.userAgent || '');
+  el.textContent = inWx ? '💡 微信里录音可能不稳，出问题就点右上角「···」用浏览器打开' : '';
 }
 
 /* ========== Result Page ========== */
