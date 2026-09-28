@@ -1267,7 +1267,7 @@ html,body { height:100%; overflow:hidden; font-family:-apple-system,BlinkMacSyst
         </div>
         <div class="capture-state" id="captureState">
           <div class="state-idle">
-            <div class="hint-shake">按住「有屁快放」说话蓄力 · 松手爆炸</div>
+            <div class="hint-shake">按住「有屁快放」说话 · 说完自动发射</div>
             <div class="btn-group" style="margin-top:16px">
               <button class="btn btn-primary" id="chargeBtn">💨 按住·有屁快放</button>
               <button class="btn btn-secondary" onclick="showManualInput()">✍️ 手动装填</button>
@@ -2568,15 +2568,15 @@ function startChargeHold() {
     pressure: 0, fart: fart, gasInterval: null, rafId: null,
     released: false, speechText: '', interimText: '', speechSupported: false,
     hasVoice: false, micStarted: false, speechError: null, speaking: false,
-    lastVoiceAt: 0, startAt: Date.now(), graceMs: 0,
+    lastVoiceAt: 0, startAt: Date.now(),
     recognitionEnded: false, restartCount: 0,
   };
 
   const stateEl = document.getElementById('captureState');
   stateEl.innerHTML = `
     <div class="fart-charge-container" style="--fart-color:${fart.type.color};--fart-color2:${fart.type.color2}">
-      <div class="fart-charge-label">💨 按住说话，边说边蓄力</div>
-      <div class="fart-charge-sub" id="chargeSub">${fart.type.name}正在酝酿 · 松手爆炸</div>
+      <div class="fart-charge-label">💨 按住说话，说完自动发射</div>
+      <div class="fart-charge-sub" id="chargeSub">${fart.type.name}正在酝酿 · 说完停一下就炸</div>
       <div class="fart-butt">
         🍑
         <div class="fart-charge-ring"></div>
@@ -2590,7 +2590,7 @@ function startChargeHold() {
       <div id="chargeLiveText" style="font-size:13px;color:var(--text2);margin-top:6px;min-height:18px;max-height:36px;overflow:hidden;text-align:center;padding:0 8px"></div>
       <div id="chargeMicStatus" style="font-size:12px;color:var(--text3);margin-top:4px;min-height:16px">🎤 正在开启麦克风…</div>
       <div class="btn-group" style="margin-top:12px">
-        <button class="btn btn-secondary" style="flex:1" onclick="endChargeHold()">💥 松手爆炸</button>
+        <button class="btn btn-secondary" style="flex:1" onclick="endChargeHold()">💥 立即爆炸</button>
         <button class="btn btn-ghost" style="flex:1" onclick="cancelCapture()">取消</button>
       </div>
     </div>`;
@@ -2699,9 +2699,12 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
         else if (e.error === 'no-speech') { /* 不报错，可能是用户没说话 */ }
         else if (e.error === 'aborted') { /* stop() 触发的正常中断，不提示 */ }
         else if (e.error === 'network') micEl.textContent = '🎤 语音识别需联网，请检查网络';
+        else if (e.error === 'service-not-allowed') micEl.textContent = '🎤 语音服务连不上（网络限制/系统不支持），可用手动装填';
         else if (e.error === 'audio-capture') micEl.textContent = '🎤 麦克风硬件问题';
         else micEl.textContent = '🎤 语音识别异常：' + e.error;
       }
+      // 便于真机排查：把错误码打到控制台
+      console.warn('[语音] 错误码 =', e.error, '｜hasVoice =', !!cs.hasVoice);
     };
 
     rec.onend = () => {
@@ -2745,9 +2748,10 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
   const startTime = Date.now();
   let lastTs = (typeof performance !== 'undefined' ? performance.now() : Date.now());
   // 真实速率（每秒气压增量），不再按帧累加，保证 60Hz / 120Hz 表现一致
-  const SPEAK_RATE = 13;  // 说话时约 7.7 秒蓄满，留够说完一句话的时间
-  const IDLE_RATE = 4.0;  // 没说话时缓慢上涨，约 25 秒蓄满（在 30 秒超时保护内）
-  const GRACE_MS = 2500;  // 蓄满后若仍在说话，最多宽限 2.5 秒
+  // 注意：气压现在只是「说了多久」的视觉指示，不再决定何时结束（结束由语音判定）
+  const SPEAK_RATE = 14;      // 说话时气压上涨，约 7 秒到满格
+  const IDLE_RATE = 2.0;      // 静默时几乎不涨
+  const SILENCE_END_MS = 1800; // 说完判定：静默超过这个时长就自动进入下一环节
   function tick(ts) {
     if (!cs || cs.released) return;
     const now = (typeof ts === 'number' && ts) || (typeof performance !== 'undefined' ? performance.now() : Date.now());
@@ -2757,7 +2761,8 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
     const elapsed = (Date.now() - startTime) / 1000;
 
     // 用「最近一次语音回调」的时间戳判断是否在说话，不会卡死在 true
-    const speaking = cs.lastVoiceAt > 0 && (Date.now() - cs.lastVoiceAt) < 1200;
+    const silentFor = cs.lastVoiceAt > 0 ? (Date.now() - cs.lastVoiceAt) : elapsed * 1000;
+    const speaking = cs.lastVoiceAt > 0 && silentFor < 1200;
     cs.speaking = speaking;
     cs.pressure += speaking ? dt * SPEAK_RATE : dt * IDLE_RATE;
     const pct = Math.min(100, cs.pressure);
@@ -2784,12 +2789,26 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
       });
     }
 
-    // 憋满自动爆炸：仍在说话则给 2.5 秒宽限，避免话说到一半被截断
-    if (pct >= 100) {
-      if (speaking && cs.graceMs < GRACE_MS) {
-        cs.graceMs += dt * 1000;
-      } else { endChargeHold(); return; }
+    // 说完判定：开过口 + 已经有文本 + 静默够久 → 自动爆炸进入下一环节
+    // 这是结束的主路径，气压不再决定何时结束
+    const hasText = ((cs.speechText || '') + (cs.interimText || '')).trim().length > 0;
+    if (cs.hasVoice && hasText && silentFor >= SILENCE_END_MS) {
+      endChargeHold();
+      return;
     }
+
+    // 停顿中给个提示，让用户知道系统会自己往下走
+    const micHintEl = document.getElementById('chargeMicStatus');
+    if (!speaking && hasText && silentFor > 700) {
+      if (cs._micHint !== 'silence' && micHintEl) {
+        cs._micHint = 'silence';
+        micHintEl.textContent = '🤫 停一下就自动发射…（也可以松手）';
+      }
+    } else if (speaking && cs._micHint !== 'speaking' && micHintEl) {
+      cs._micHint = 'speaking';
+      micHintEl.textContent = '🎤 检测到说话，蓄力加速！';
+    }
+
     // 超时保护 30 秒
     if (elapsed >= 30) { endChargeHold(); return; }
 
@@ -3628,7 +3647,7 @@ function resetToCapture() {
   document.getElementById('captureState').style.display = 'block';
   document.getElementById('captureState').innerHTML = `
     <div class="state-idle">
-      <div class="hint-shake">按住「有屁快放」说话蓄力 · 松手爆炸</div>
+      <div class="hint-shake">按住「有屁快放」说话 · 说完自动发射</div>
       <div class="btn-group" style="margin-top:16px">
         <button class="btn btn-primary" id="chargeBtn">💨 按住·有屁快放</button>
         <button class="btn btn-secondary" onclick="showManualInput()">✍️ 手动装填</button>
