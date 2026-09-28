@@ -2598,7 +2598,21 @@ function startChargeHold() {
     mode: 'record',
     hasVoice: false, micStarted: false, speechError: null, speaking: false,
     lastVoiceAt: 0, startAt: Date.now(),
+    streamPromise: null,
   };
+
+  // iOS 要求 getUserMedia 必须在用户手势的激活期内发起。一旦 await 过别的东西，
+  // 手势就失效了，之后再请求会被静默拒绝（表现同样是「点了允许却没反应」）。
+  // 所以在 pointerdown 的同步栈里先把请求发出去，后面 recordVoice 直接复用这个 Promise。
+  try {
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      const sp = navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      sp.catch(() => {}); // 避免 unhandled rejection，真正的处理在 recordVoice 里
+      _chargeState.streamPromise = sp;
+    }
+  } catch (e) {}
 
   const stateEl = document.getElementById('captureState');
   stateEl.innerHTML = `
@@ -2694,23 +2708,68 @@ function encodeWavBlob(samples, sampleRate) {
   return new Blob([view.buffer], { type: 'audio/wav' });
 }
 
-async function transcribeAudio(float32, sampleRate) {
+async function _asrPost(blob, filename) {
   const key = getASRKey();
   if (!key) throw new Error('no-asr-key');
   const form = new FormData();
-  form.append('file', encodeWavBlob(float32, sampleRate || 16000), 'voice.wav');
+  form.append('file', blob, filename);
   form.append('model', ASR_MODEL);
-  const res = await fetch(ASR_URL, {
-    method: 'POST',
-    headers: { Authorization: 'Bearer ' + key },
-    body: form,
-  });
+  const res = await fetch(ASR_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + key }, body: form });
   if (!res.ok) {
     const t = await res.text().catch(() => '');
-    throw new Error('ASR HTTP ' + res.status + ' ' + t.slice(0, 120));
+    const err = new Error('ASR HTTP ' + res.status + ' ' + t.slice(0, 120));
+    err.httpStatus = res.status;
+    throw err;
   }
   const j = await res.json();
   return ((j && j.text) || '').trim();
+}
+
+// 把任意浏览器录音 Blob 解码成 16k 单声道 Float32，用于兜底重传
+async function _decodeBlobTo16k(blob) {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC || !blob) throw new Error('decode-unavailable');
+  let ctx;
+  try { ctx = new AC({ sampleRate: 16000 }); } catch (e) { ctx = new AC(); }
+  try {
+    if (ctx.state === 'suspended') await ctx.resume().catch(() => {});
+    const buf = await blob.arrayBuffer();
+    const decoded = await ctx.decodeAudioData(buf);
+    const ch = decoded.getChannelData(0);
+    if (Math.abs(decoded.sampleRate - 16000) < 1) return ch;
+    const ratio = decoded.sampleRate / 16000;
+    const outLen = Math.floor(ch.length / ratio);
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const p = i * ratio, i0 = Math.floor(p), i1 = Math.min(i0 + 1, ch.length - 1), f = p - i0;
+      out[i] = ch[i0] * (1 - f) + ch[i1] * f;
+    }
+    return out;
+  } finally { try { ctx.close(); } catch (e) {} }
+}
+
+/**
+ * 转写。payload: { blob, ext }（MediaRecorder 产物）或 { float32, sampleRate }（兜底）
+ * 优先直接上传浏览器原始编码（webm/mp4），服务端拒收时解码成 WAV 再传一次。
+ */
+async function transcribeAudio(payload) {
+  const p = payload || {};
+  if (p.blob) {
+    const ext = p.ext || 'webm';
+    try {
+      return await _asrPost(p.blob, 'voice.' + ext);
+    } catch (e) {
+      if (e && e.message === 'no-asr-key') throw e;
+      console.warn('原始格式上传失败，尝试解码为 WAV 重传:', e && e.message);
+    }
+  }
+  let f32 = p.float32;
+  if (!f32 && p.blob) {
+    try { f32 = await _decodeBlobTo16k(p.blob); }
+    catch (e) { throw new Error('ASR 上传失败且无法转码：' + ((e && e.message) || e)); }
+  }
+  if (!f32 || !f32.length) throw new Error('ASR 上传失败：音频为空');
+  return await _asrPost(encodeWavBlob(f32, 16000), 'voice.wav');
 }
 
 
@@ -2730,6 +2789,8 @@ async function _runRecordASRCharge(cs, liquid, pLabel, cracks) {
     // 录音：音量驱动气压（仅视觉），说完停顿 1.8 秒自动结束，松手也立即结束
     const rec = await recordVoice(30, {
       charge: true,
+      // 复用 startChargeHold 在手势栈里发出的 getUserMedia 请求（iOS 必需）
+      streamPromise: cs.streamPromise,
       onReady: () => {
         // 拿到麦克风了，明确告诉用户，方便区分「没授权」和「授权了但没声音」
         const el = document.getElementById('chargeMicStatus');
@@ -2767,15 +2828,18 @@ async function _runRecordASRCharge(cs, liquid, pLabel, cracks) {
     if (!rec || rec.cancelled) { resetToCapture(); return; }
 
     state._chargeHasVoice = !!rec.hasVoice;
-    if (!rec.hasVoice || !rec.audio || rec.audio.length < 1600) {
+    // 不再依赖 rec.audio：MediaRecorder 直接给 Blob。
+    // 注意不能只凭 hasVoice 判空 —— 音量检测起不来时 hasVoice 为 false 但音频是完整的
+    const bytes = rec.blob ? rec.blob.size : 0;
+    if (!rec.blob || bytes < 1200) {
       showToast('没听到声音，可用手动装填');
-      showFailState('没听到声音，可以再说一次');
+      showFailState(rec.volOK ? '没听到声音，可以再说一次' : '没检测到声音，请大声点再说一次');
       return;
     }
 
     releaseFart();
     updateASRStatusUI('🧪 识别中…', '约 1-2 秒');
-    const text = await transcribeAudio(rec.audio, 16000);
+    const text = await transcribeAudio({ blob: rec.blob, ext: rec.ext });
     state._chargeText = text;
     recognizeSpeech(text);
   } catch (e) {
@@ -2970,105 +3034,186 @@ function renderRecUIStatic() {
     </div>`;
 }
 
+/* ========== 录音（MediaRecorder）==========
+ * 之前用 ScriptProcessorNode 采集：它依赖 AudioContext 真正跑起来，
+ * 而 iOS / 微信 X5 / 部分安卓上，await getUserMedia 之后 AudioContext 会停在 suspended，
+ * onaudioprocess 一帧都不回调 —— 表现就是「权限点了允许，但完全听不到」。
+ * 现在改为 MediaRecorder 录音：它直接吃 MediaStream，不经过 AudioContext，兼容性好得多。
+ * AudioContext 退化成「可选」：只用来做音量可视化和静默检测，
+ * 就算它起不来，录音本身照样完整，用户点「立即爆炸」仍能拿到音频。
+ */
+function _pickRecMime() {
+  if (typeof MediaRecorder === 'undefined') return null;
+  const cands = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4', 'audio/mpeg'];
+  try {
+    for (const c of cands) if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(c)) return c;
+  } catch (e) {}
+  return '';
+}
+
+function _mimeExt(mime) {
+  const m = (mime || '').toLowerCase();
+  if (m.indexOf('webm') >= 0) return 'webm';
+  if (m.indexOf('ogg') >= 0 || m.indexOf('opus') >= 0) return 'ogg';
+  if (m.indexOf('mp4') >= 0) return 'mp4';
+  if (m.indexOf('mpeg') >= 0 || m.indexOf('mp3') >= 0) return 'mp3';
+  return 'webm';
+}
+
 function recordVoice(maxSec = 20, opts = {}) {
-  return new Promise(async (resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const charge = !!opts.charge;
-    let stream, ctx, processor, source, mute;
-    let chunks = [], hasVoice = false, lastVoiceAt = 0, startTime = 0, stopped = false;
-    let pressure = 0, cancelled = false, frames = 0;
+    const recMime = _pickRecMime();
+    if (recMime === null) { reject(new Error('unsupported')); return; }
+
+    let stream, ctx, analyser, source, rec = null;
+    let timerId = null, blobs = [], lastChunkSize = 0;
+    let hasVoice = false, lastVoiceAt = 0, startTime = 0, stopped = false, finished = false;
+    let pressure = 0, cancelled = false, frames = 0, volOK = false;
+
+    const setStatus = (txt) => {
+      const el = document.getElementById('chargeMicStatus');
+      if (el) el.textContent = txt;
+    };
+    const stopTimer = () => { if (timerId) { clearInterval(timerId); timerId = null; } };
 
     const cleanup = () => {
-      stopped = true;
+      stopTimer();
       window.__finishRec = null;
       window.__cancelRec = null;
-      try { if (processor) processor.onaudioprocess = null; } catch(e) {}
-      try { if (source) source.disconnect(); } catch(e) {}
-      try { if (processor) processor.disconnect(); } catch(e) {}
-      try { if (mute) mute.disconnect(); } catch(e) {}
-      try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch(e) {}
-      try { if (ctx) ctx.close(); } catch(e) {}
+      try { if (source) source.disconnect(); } catch (e) {}
+      try { if (analyser) analyser.disconnect(); } catch (e) {}
+      try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+      // ctx 是全局预热的那一个，别 close，留给下一次录音复用
+    };
+
+    const done = (reason) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      const blob = blobs.length ? new Blob(blobs, { type: recMime || 'audio/webm' }) : null;
+      resolve({
+        blob, ext: _mimeExt(recMime), hasVoice, cancelled,
+        volOK, duration: startTime ? (Date.now() - startTime) / 1000 : 0, reason: reason || '',
+      });
     };
 
     const finish = (reason) => {
-      if (stopped) return;
-      const total = chunks.reduce((n, c) => n + c.length, 0);
-      const audio = new Float32Array(total);
-      let off = 0;
-      for (const c of chunks) { audio.set(c, off); off += c.length; }
-      cleanup();
-      resolve({ audio: resampleTo16k(audio, ctx.sampleRate), hasVoice, cancelled, reason: reason || '' });
+      if (stopped || finished) return;
+      stopped = true;
+      stopTimer();
+      if (rec && rec.state && rec.state !== 'inactive') {
+        let guard = setTimeout(() => done(reason), 800); // onstop 不触发的兜底
+        try {
+          rec.onstop = () => { clearTimeout(guard); done(reason); };
+          rec.stop();
+        } catch (e) { clearTimeout(guard); done(reason); }
+      } else {
+        done(reason);
+      }
     };
     window.__finishRec = () => finish('manual');
     window.__cancelRec = () => { cancelled = true; finish('cancel'); };
 
-    // 环境检查：非安全上下文（http）或老内核（部分微信 X5）拿不到这些 API
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if (!navigator.mediaDevices || !AC) { cleanup(); reject(new Error('unsupported')); return; }
-
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true },
-      });
-    } catch (e) {
-      cleanup();
-      reject(new Error('mic'));
-      return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === 'undefined') {
+      cleanup(); reject(new Error('unsupported')); return;
     }
-    // 复用手势阶段预热好的 AudioContext。
-    // iOS / 部分安卓上，await getUserMedia 之后再 new AudioContext() 会停在 suspended，
-    // onaudioprocess 一帧都不回调 —— 表现就是「权限给了，但完全听不到」
-    if (window.__audioCtx && window.__audioCtx.state !== 'closed') ctx = window.__audioCtx;
-    else { try { ctx = new AC({ sampleRate: 16000 }); } catch (e) { ctx = new AC(); } }
 
-    source = ctx.createMediaStreamSource(stream);
-    processor = ctx.createScriptProcessor(4096, 1, 1);
-    mute = ctx.createGain();
-    mute.gain.value = 0;
-    source.connect(processor);
-    processor.connect(mute);
-    mute.connect(ctx.destination);
-    startTime = Date.now();
-    if (ctx.state === 'suspended') ctx.resume();
-    if (!charge) renderRecUIStatic();
-    if (opts.onReady) opts.onReady();
-
-    // 兜底：授权了但音频图没跑起来的机型，补一次 resume；再不行就明确报错，别让用户干等
-    setTimeout(() => { if (!stopped && frames === 0) { try { ctx.resume(); } catch (e) {} } }, 800);
-    setTimeout(() => {
-      if (!stopped && frames === 0) { cleanup(); reject(new Error('no-audio')); }
-    }, 2600);
-
-    processor.onaudioprocess = (e) => {
-      if (stopped) return;
-      frames++;
-      const data = e.inputBuffer.getChannelData(0);
-      chunks.push(new Float32Array(data));
-      let sum = 0;
-      for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-      const rms = Math.sqrt(sum / data.length);
-      if (rms > 0.02) { hasVoice = true; lastVoiceAt = Date.now(); }
-
-      const elapsed = (Date.now() - startTime) / 1000;
-
-      if (charge) {
-        // 语音蓄力：气压只做视觉指示，结束完全由「说完/超时」决定，不因气压满而中断
-        const dt = e.inputBuffer.duration || 0.1;
-        const loud = Math.min(1, rms / 0.25);
-        pressure += rms > 0.015 ? dt * 14 : dt * 2;
-        if (opts.onTick) opts.onTick({ rms, loud, hasVoice, elapsed, pressure: Math.min(100, pressure) });
-      } else {
-        const secEl = document.getElementById('recSec');
-        if (secEl) secEl.textContent = elapsed.toFixed(1) + 's';
-        const hintEl = document.getElementById('recHint');
-        if (hintEl) hintEl.textContent = hasVoice ? '检测到说话 · 停顿1.8秒自动结束' : '说话吧，我在录';
-      }
-
-      if (hasVoice && Date.now() - lastVoiceAt > 1800) finish('pause');
-      else if (!hasVoice && elapsed > 12) finish('silent');
-      else if (elapsed >= maxSec) finish('max');
+    const getStream = () => {
+      if (opts.streamPromise) return opts.streamPromise;
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.reject(new Error('unsupported'));
+      return navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
     };
+
+    getStream().then((s) => {
+      if (stopped || finished) { try { s.getTracks().forEach(t => t.stop()); } catch (e) {} return; }
+      stream = s;
+      try { rec = new MediaRecorder(stream, recMime ? { mimeType: recMime } : undefined); }
+      catch (e) { try { rec = new MediaRecorder(stream); } catch (e2) { rec = null; } }
+      if (!rec) { cleanup(); reject(new Error('unsupported')); return; }
+
+      rec.ondataavailable = (e) => {
+        if (e && e.data && e.data.size > 0) { blobs.push(e.data); lastChunkSize = e.data.size; }
+      };
+      rec.onerror = () => { cleanup(); reject(new Error('mic')); };
+      try { rec.start(250); } catch (e) { cleanup(); reject(new Error('mic')); return; }
+
+      startTime = Date.now();
+      if (!charge) renderRecUIStatic();
+      if (opts.onReady) opts.onReady();
+      setStatus('🎤 麦克风已开 · 说完停一下就自动发射');
+
+      // 音量检测（可选）。起不来不影响录音，只是没有「静默自动结束」和气压动画
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const buf = AC ? new Float32Array(1024) : null;
+      try {
+        ctx = (window.__audioCtx && window.__audioCtx.state !== 'closed') ? window.__audioCtx
+          : (AC ? new AC() : null);
+        if (ctx && ctx.state === 'suspended') ctx.resume();
+        if (ctx && AC) {
+          source = ctx.createMediaStreamSource(stream);
+          analyser = ctx.createAnalyser();
+          analyser.fftSize = 2048;
+          source.connect(analyser); // 不连 destination，避免回声
+        }
+      } catch (e) { analyser = null; }
+
+      const readRms = () => {
+        if (!analyser || !buf) return 0;
+        try {
+          analyser.getFloatTimeDomainData(buf);
+          let sum = 0;
+          for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+          return Math.sqrt(sum / buf.length);
+        } catch (e) { return 0; }
+      };
+
+      timerId = setInterval(() => {
+        if (stopped || finished) { stopTimer(); return; }
+        const now = Date.now();
+        const elapsed = (now - startTime) / 1000;
+        let rms = readRms();
+
+        // 音量检测不可用时的降级：用 MediaRecorder 分片大小粗判有没有声音
+        if (!volOK && elapsed > 1.2 && frames === 0) {
+          if (lastChunkSize > 1200) rms = 0.05; else rms = 0;
+        } else if (rms > 0) {
+          volOK = true;
+        }
+        if (rms > 0) frames++;
+        const loud = Math.min(1, rms / 0.25);
+        if (rms > 0.02) { hasVoice = true; lastVoiceAt = now; }
+
+        pressure += rms > 0.015 ? 0.1 * 14 : 0.1 * 2;
+
+        if (charge) {
+          if (opts.onTick) opts.onTick({ rms, loud, hasVoice, elapsed, pressure: Math.min(100, pressure) });
+        } else {
+          const secEl = document.getElementById('recSec');
+          if (secEl) secEl.textContent = elapsed.toFixed(1) + 's';
+          const hintEl = document.getElementById('recHint');
+          if (hintEl) hintEl.textContent = hasVoice ? '检测到说话 · 停顿1.8秒自动结束' : '说话吧，我在录';
+        }
+
+        // 音量检测不可用：明确告知用户手动结束，并把上限压到 15 秒，别让他干等
+        if (elapsed > 2.6 && frames === 0 && !hasVoice) {
+          setStatus('🎤 录音中 · 说完点「立即爆炸」');
+        }
+        const limit = (frames === 0 && elapsed > 2.6) ? Math.min(maxSec, 15) : maxSec;
+
+        if (hasVoice && now - lastVoiceAt > 1800) finish('pause');
+        else if (!hasVoice && elapsed > 12) finish('silent');
+        else if (elapsed >= limit) finish('max');
+      }, 100);
+    }).catch((e) => {
+      cleanup();
+      reject(new Error((e && e.message === 'unsupported') ? 'unsupported' : 'mic'));
+    });
   });
 }
+
 
 /* ========== 转写结果处理 ========== */
 async function recognizeSpeech(text) {
@@ -3561,8 +3706,10 @@ function resetToCapture() {
 function updateMicEnvHint() {
   const el = document.getElementById('micEnvHint');
   if (!el) return;
+  // MediaRecorder 是现在的录音主体，AudioContext 只做音量可视化，不再作为可用性判据
+  const hasMR = typeof MediaRecorder !== 'undefined';
   const canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia
-    && (window.AudioContext || window.webkitAudioContext));
+    && hasMR && _pickRecMime() !== null);
   if (!canRecord) {
     el.innerHTML = '⚠️ 当前环境不支持录音（多见于微信内置浏览器或非 HTTPS 页面）<br>'
       + '请点右上角「···」→ 在浏览器打开，或直接用「手动装填」';
