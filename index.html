@@ -2566,8 +2566,10 @@ function startChargeHold() {
     recognition: null,
     ctx: null, analyser: null, source: null, stream: null,
     pressure: 0, fart: fart, gasInterval: null, rafId: null,
-    released: false, speechText: '', speechSupported: false,
-    hasVoice: false,
+    released: false, speechText: '', interimText: '', speechSupported: false,
+    hasVoice: false, micStarted: false, speechError: null, speaking: false,
+    lastVoiceAt: 0, startAt: Date.now(), graceMs: 0,
+    recognitionEnded: false, restartCount: 0,
   };
 
   const stateEl = document.getElementById('captureState');
@@ -2643,16 +2645,23 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
     rec.lang = 'zh-CN';
     rec.continuous = true;
     rec.interimResults = true;
+    rec.maxAlternatives = 1;
+
+    // 记录「最近一次听到声音」的时间戳，代替布尔量，避免状态卡死
+    const touchVoice = () => {
+      cs.lastVoiceAt = Date.now();
+      cs.hasVoice = true;
+    };
 
     rec.onstart = () => {
       cs.speechActive = true;
+      cs.micStarted = true;
       const micEl = document.getElementById('chargeMicStatus');
       if (micEl) micEl.textContent = '🎤 正在听… 对着说话！';
     };
 
     rec.onspeechstart = () => {
-      cs.speaking = true;
-      cs.hasVoice = true;
+      touchVoice();
       const micEl = document.getElementById('chargeMicStatus');
       if (micEl) micEl.textContent = '🎤 检测到说话，蓄力加速！';
       // 声波条跳动
@@ -2663,7 +2672,7 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
     };
 
     rec.onspeechend = () => {
-      cs.speaking = false;
+      // 不直接置 speaking=false：改由 lastVoiceAt 时间戳衰减判断，避免状态卡死
     };
 
     rec.onresult = (e) => {
@@ -2673,13 +2682,12 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
         if (e.results[i].isFinal) final += t;
         else interim += t;
       }
-      if (final) cs.speechText += final;
-      cs.interimText = interim;
+      if (final) { cs.speechText += final; cs.interimText = ''; }
+      else if (interim) cs.interimText = interim;
       const liveEl = document.getElementById('chargeLiveText');
       if (liveEl) liveEl.textContent = (cs.speechText + interim).slice(0, 60);
-      // 有结果说明在说话，加速蓄力
-      cs.hasVoice = true;
-      cs.speaking = true;
+      // 有结果说明在说话，加速蓄力（时间戳衰减，不设死标志）
+      touchVoice();
     };
 
     rec.onerror = (e) => {
@@ -2689,6 +2697,7 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
       if (micEl) {
         if (e.error === 'not-allowed') micEl.textContent = '🎤 麦克风被拒，请允许权限或用手动装填';
         else if (e.error === 'no-speech') { /* 不报错，可能是用户没说话 */ }
+        else if (e.error === 'aborted') { /* stop() 触发的正常中断，不提示 */ }
         else if (e.error === 'network') micEl.textContent = '🎤 语音识别需联网，请检查网络';
         else if (e.error === 'audio-capture') micEl.textContent = '🎤 麦克风硬件问题';
         else micEl.textContent = '🎤 语音识别异常：' + e.error;
@@ -2698,24 +2707,28 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
     rec.onend = () => {
       cs.recognitionEnded = true;
       cs.speechActive = false;
-      // 松手时还没拿到 final，用 interim 兜底
-      if (!cs.speechText && cs.interimText) {
+      // 已松手：interim 兜底进 speechText（此时不再重启，不会重复拼接）
+      if (cs.released && !cs.speechText && cs.interimText) {
         cs.speechText = cs.interimText.trim();
+        cs.interimText = '';
       }
-      // 如果还在蓄力中（用户没松手），自动重启识别
+      // 还在蓄力中（用户没松手）：自动重启识别
       // Web Speech API 会在停顿时自动 stop，不重启后续说话全丢
-      if (!cs.released) {
-        cs.interimText = ''; // 重置 interim，避免重复
+      // 退避 400ms 起逐次加长，最多 8 次，避免高频 start/stop 被 Chrome 限流
+      if (!cs.released && cs.restartCount < 8) {
+        cs.restartCount++;
+        const delay = 400 + cs.restartCount * 100;
         setTimeout(() => {
           if (!cs.released && cs.recognition) {
             try {
-              cs.recognition.start();
+              cs.interimText = '';
               cs.recognitionEnded = false;
+              cs.recognition.start();
             } catch (e) {
               console.warn('SpeechRecognition restart failed:', e);
             }
           }
-        }, 100);
+        }, delay);
       }
     };
 
@@ -2730,14 +2743,23 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
 
   // 计时器驱动气压（不依赖 getUserMedia）
   const startTime = Date.now();
-  function tick() {
+  let lastTs = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  // 真实速率（每秒气压增量），不再按帧累加，保证 60Hz / 120Hz 表现一致
+  const SPEAK_RATE = 13;  // 说话时约 7.7 秒蓄满，留够说完一句话的时间
+  const IDLE_RATE = 4.0;  // 没说话时缓慢上涨，约 25 秒蓄满（在 30 秒超时保护内）
+  const GRACE_MS = 2500;  // 蓄满后若仍在说话，最多宽限 2.5 秒
+  function tick(ts) {
     if (!cs || cs.released) return;
+    const now = (typeof ts === 'number' && ts) || (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    // 真实帧间隔：高刷屏（120Hz）下不会让蓄力速度翻倍
+    const dt = Math.min(0.1, Math.max(0, (now - lastTs) / 1000));
+    lastTs = now;
     const elapsed = (Date.now() - startTime) / 1000;
-    const dt = 0.05;
 
-    // 说话时气压涨得快，没说话时缓慢涨
-    // 说话时 ~6秒蓄满（给用户时间说完话），没说话时 ~25秒保底
-    cs.pressure += cs.speaking ? dt * 5.5 : dt * 1.5;
+    // 用「最近一次语音回调」的时间戳判断是否在说话，不会卡死在 true
+    const speaking = cs.lastVoiceAt > 0 && (Date.now() - cs.lastVoiceAt) < 1200;
+    cs.speaking = speaking;
+    cs.pressure += speaking ? dt * SPEAK_RATE : dt * IDLE_RATE;
     const pct = Math.min(100, cs.pressure);
 
     // 更新 UI
@@ -2762,8 +2784,12 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
       });
     }
 
-    // 憋满自动爆炸
-    if (pct >= 100) { endChargeHold(); return; }
+    // 憋满自动爆炸：仍在说话则给 2.5 秒宽限，避免话说到一半被截断
+    if (pct >= 100) {
+      if (speaking && cs.graceMs < GRACE_MS) {
+        cs.graceMs += dt * 1000;
+      } else { endChargeHold(); return; }
+    }
     // 超时保护 30 秒
     if (elapsed >= 30) { endChargeHold(); return; }
 
@@ -2775,10 +2801,14 @@ async function _startSpeechAndAudio(fart, liquid, pLabel, cracks) {
 // 浏览器不支持 Web Speech API 时的纯计时器兜底
 function _startTimerOnlyCharge(cs, liquid, pLabel, cracks) {
   const startTime = Date.now();
-  function tick() {
+  let lastTs = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  function tick(ts) {
     if (!cs || cs.released) return;
+    const now = (typeof ts === 'number' && ts) || (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    const dt = Math.min(0.1, Math.max(0, (now - lastTs) / 1000));
+    lastTs = now;
     const elapsed = (Date.now() - startTime) / 1000;
-    cs.pressure += 0.05 * 8; // 固定速率
+    cs.pressure += dt * 20; // 真实速率，无语音识别时约 5 秒蓄满
     const pct = Math.min(100, cs.pressure);
     const timerEl = document.getElementById('fartTimer');
     const fillEl = document.getElementById('fartChargeFill');
@@ -2813,10 +2843,18 @@ function endChargeHold() {
 
   state._chargeHasVoice = cs.hasVoice;
 
-  // 没说话也没识别到文本——直接失败
-  if (!cs.hasVoice && !cs.speechText && !cs.interimText) {
-    showToast('没听到声音，可用手动装填');
-    showFailState();
+  // 没有可用文本——直接失败，但区分「没说话」和「说了没识别出来」
+  const finalText = (cs.speechText || '').trim();
+  const interimText = (cs.interimText || '').trim();
+  if (!finalText && !interimText) {
+    let hint = '没听到声音，可以再说一次';
+    if (cs.hasVoice || cs.micStarted) {
+      if (cs.speechError === 'network') hint = '语音识别需联网，请检查网络';
+      else if (cs.speechError === 'not-allowed') hint = '麦克风权限被拒，请在浏览器里允许';
+      else hint = '听到了声音但没识别出文字，请离近点大声说';
+    }
+    showToast(hint);
+    showFailState(hint);
     return;
   }
 
@@ -2929,21 +2967,28 @@ function releaseFart() {
     overlay.classList.remove('show');
   }, 1000);
 
-  // 轮询等待 onend 把最终文本写入 _chargeState（最多等 3 秒）
+  // 松手后等 final 文本落地。
+  // 关键：onend 到了也要再给 600ms 缓冲，否则 final 迟到会被判成「没听到声音」
+  // 用闭包固定本次的 chargeState，防止用户立刻二次按住时读到新对象
+  const csRef = _chargeState;
+  const waitStart = Date.now();
   const waitAndRecognize = () => {
-    const cs = _chargeState;
-    // onend 已触发，或已有 final 文本，或等够 3 秒
-    if (!cs || cs.recognitionEnded || cs.speechText || (Date.now() - waitStart) >= 3000) {
-      let text = (cs && cs.speechText || '').trim();
-      if (!text && cs && cs.interimText) text = cs.interimText.trim();
+    const waited = Date.now() - waitStart;
+    const finalText = ((csRef && csRef.speechText) || '').trim();
+    const interim = ((csRef && csRef.interimText) || '').trim();
+    // 结算条件：拿到 final 且识别已结束 / onend 已到且缓冲给足 / 硬上限 1.5 秒
+    const settled = !csRef
+      || (csRef.recognitionEnded && (finalText || waited >= 600))
+      || waited >= 1500;
+    if (settled) {
+      const text = finalText || interim;
       state._chargeText = text;
       recognizeSpeech(text);
     } else {
-      setTimeout(waitAndRecognize, 200);
+      setTimeout(waitAndRecognize, 80);
     }
   };
-  const waitStart = Date.now();
-  setTimeout(waitAndRecognize, 500);
+  setTimeout(waitAndRecognize, 250);
 }
 
 /* ========== 本地语音识别 (Whisper on-device via transformers.js) ========== */
@@ -3172,18 +3217,30 @@ async function processRecognizedText(text) {
   showResult(match);
 }
 
-function showFailState() {
+function showFailState(hint) {
   clearInterval(state._gasInterval);
   state.captureState = 'fail';
   const stateEl = document.getElementById('captureState');
+  const msg = hint || '没关系，手动装填一样可以';
   stateEl.innerHTML = `
     <div style="text-align:center">
       <div style="font-size:40px;margin-bottom:12px">💨😵‍💫</div>
       <div style="font-size:16px;color:var(--text2);margin-bottom:8px">屁太响，没听清</div>
-      <div style="font-size:13px;color:var(--text3);margin-bottom:16px">没关系，手动装填一样可以</div>
-      <button class="btn btn-primary" style="width:100%" onclick="showManualInput()">✍️ 手动装填</button>
-      <button class="btn btn-ghost" style="margin-top:8px;width:100%" onclick="resetToCapture()">重新蓄屁</button>
+      <div style="font-size:13px;color:var(--text3);margin-bottom:16px">${msg}</div>
+      <button class="btn btn-primary" style="width:100%" onclick="retryCapture()">🎤 再说一次</button>
+      <button class="btn btn-secondary" style="margin-top:8px;width:100%" onclick="showManualInput()">✍️ 手动装填</button>
+      <button class="btn btn-ghost" style="margin-top:8px;width:100%" onclick="resetToCapture()">返回</button>
     </div>`;
+}
+
+// 失败后直接重新开麦，省掉一次「返回」点击
+function retryCapture() {
+  const manualEl = document.getElementById('manualInputArea');
+  if (manualEl) manualEl.style.display = 'none';
+  const stateEl = document.getElementById('captureState');
+  if (stateEl) stateEl.style.display = 'block';
+  state.captureState = 'idle';
+  startChargeHold();
 }
 
 function showManualInput() {
