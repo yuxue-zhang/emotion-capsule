@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>语音诊断 · 情绪胶囊机</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin:0; padding:18px; background:#17171A; color:#E8E6E1; font-size:14px; line-height:1.6;
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",system-ui,sans-serif; }
+  h1 { font-size:17px; margin:0 0 4px; font-weight:600; }
+  .sub { font-size:12px; color:#8A8A84; margin-bottom:18px; }
+  .btn { display:block; width:100%; padding:15px; border:none; border-radius:12px;
+    background:#F5C518; color:#17171A; font-size:15px; font-weight:600; margin-bottom:18px;
+    font-family:inherit; }
+  .btn:disabled { background:#33332F; color:#8A8A84; }
+  .btn.ghost { background:transparent; color:#C9C6BF; border:0.5px solid #3A3A38; font-weight:400; }
+  .row { display:flex; gap:10px; padding:9px 0; border-bottom:0.5px solid #26262A; align-items:flex-start; }
+  .ic { flex:0 0 16px; width:16px; font-size:12px; line-height:1.7; }
+  .k { flex:0 0 92px; color:#8A8A84; font-size:13px; }
+  .v { flex:1; word-break:break-all; font-size:13px; }
+  .ok { color:#5DCAA5; } .bad { color:#F09595; } .warn { color:#EF9F27; } .dim { color:#8A8A84; }
+  textarea { width:100%; height:150px; background:#0F0F11; color:#C9C6BF; border:0.5px solid #3A3A38;
+    border-radius:8px; padding:10px; font-size:12px; margin-top:12px;
+    font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .note { font-size:13px; background:#1F1F1D; border-radius:8px; padding:12px 14px; margin-top:16px;
+    border-left:2px solid #F5C518; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<h1>语音诊断</h1>
+<div class="sub">点按钮 → 允许麦克风 → 对着手机说 3 秒话，全程约 8 秒</div>
+<button class="btn" id="go">开始诊断</button>
+<div id="out"></div>
+<button class="btn ghost hidden" id="copy">复制全部结果</button>
+<textarea id="raw" class="hidden" readonly></textarea>
+<div class="note hidden" id="note"></div>
+
+<script>
+const ASR_URL = 'https://api.siliconflow.cn/v1/audio/transcriptions';
+const ASR_MODEL = 'FunAudioLLM/SenseVoiceSmall';
+const BUILTIN_KEY = atob('c2stcWtnc2FnamJqc2pobWJua3R1d3lxdGVpcHdra21zcHRyd2ZyeHp4aGJyYWlidWl6');
+const CANDS = ['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4','audio/mpeg'];
+
+const R = [];
+const out = document.getElementById('out');
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function add(k, v, cls) {
+  R.push({ k, v: String(v), cls: cls || '' });
+  out.innerHTML = R.map(r =>
+    '<div class="row"><div class="ic ' + (r.cls || 'dim') + '">' +
+    (r.cls === 'ok' ? '✓' : r.cls === 'bad' ? '✕' : r.cls === 'warn' ? '!' : '·') +
+    '</div><div class="k">' + r.k + '</div><div class="v ' + (r.cls || '') + '">' +
+    r.v.replace(/</g, '&lt;') + '</div></div>').join('');
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+function extOf(mime) {
+  const m = (mime || '').toLowerCase();
+  if (m.indexOf('webm') >= 0) return 'webm';
+  if (m.indexOf('ogg') >= 0 || m.indexOf('opus') >= 0) return 'ogg';
+  if (m.indexOf('mp4') >= 0) return 'mp4';
+  if (m.indexOf('mpeg') >= 0 || m.indexOf('mp3') >= 0) return 'mp3';
+  return 'webm';
+}
+
+function encodeWav(samples, rate) {
+  const n = samples.length;
+  const view = new DataView(new ArrayBuffer(44 + n * 2));
+  const put = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+  put(0, 'RIFF'); view.setUint32(4, 36 + n * 2, true); put(8, 'WAVE');
+  put(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  put(36, 'data'); view.setUint32(40, n * 2, true);
+  for (let i = 0, o = 44; i < n; i++, o += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i] || 0));
+    view.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([view.buffer], { type: 'audio/wav' });
+}
+
+async function post(blob, filename) {
+  const fd = new FormData();
+  fd.append('file', blob, filename);
+  fd.append('model', ASR_MODEL);
+  try {
+    const res = await fetch(ASR_URL, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + BUILTIN_KEY }, body: fd,
+    });
+    const body = await res.text().catch(() => '');
+    return { status: res.status, body: body.slice(0, 240) };
+  } catch (e) {
+    return { status: '网络错误', body: (e && e.message) || String(e) };
+  }
+}
+
+async function run(streamPromise) {
+  let stream = null;
+  const ua = navigator.userAgent || '';
+  const inWx = /MicroMessenger/i.test(ua);
+  const isiOS = /iPhone|iPad|iPod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+  add('打开方式', (inWx ? '微信内置浏览器' : '普通浏览器') + ' · ' + (isiOS ? 'iOS' : 'Android/其他'));
+  add('是否 HTTPS', window.isSecureContext ? '是' : '否（浏览器会禁用麦克风）', window.isSecureContext ? 'ok' : 'bad');
+  add('mediaDevices', navigator.mediaDevices ? '有' : '无', navigator.mediaDevices ? 'ok' : 'bad');
+  add('MediaRecorder', typeof MediaRecorder !== 'undefined' ? '有' : '无（无法录音）',
+      typeof MediaRecorder !== 'undefined' ? 'ok' : 'bad');
+  add('AudioContext', (window.AudioContext || window.webkitAudioContext) ? '有' : '无（只影响音量动画）',
+      (window.AudioContext || window.webkitAudioContext) ? 'ok' : 'warn');
+
+  let sup = [];
+  try { sup = CANDS.filter(m => MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)); }
+  catch (e) {}
+  add('支持编码', sup.join('  ') || '一个都不支持', sup.length ? 'ok' : 'bad');
+
+  try { stream = await streamPromise; add('麦克风权限', '已授权', 'ok'); }
+  catch (e) {
+    add('麦克风权限', (e && e.name) + ' ' + (e && e.message), 'bad');
+    finish('麦克风没拿到。请检查手机设置里该浏览器的麦克风权限，或改用系统浏览器打开。');
+    return;
+  }
+  const tracks = stream.getAudioTracks();
+  add('音轨', tracks.length + ' 条 · ' + ((tracks[0] && tracks[0].label) || '（无标签）') +
+      ' · readyState=' + ((tracks[0] && tracks[0].readyState) || '?'));
+
+  // 音频图（音量检测）
+  const AC = window.AudioContext || window.webkitAudioContext;
+  let ctx = null, analyser = null, source = null, maxRms = 0, frames = 0;
+  try {
+    ctx = new AC();
+    add('AudioContext', '创建成功 · state=' + ctx.state, ctx.state === 'running' ? 'ok' : 'warn');
+    if (ctx.state === 'suspended') {
+      await ctx.resume().catch(() => {});
+      add('resume 之后', 'state=' + ctx.state, ctx.state === 'running' ? 'ok' : 'warn');
+    }
+    source = ctx.createMediaStreamSource(stream);
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
+  } catch (e) { add('AudioContext', '建音频图失败：' + e.message, 'warn'); }
+
+  const mime = sup[0] || '';
+  let mr = null;
+  try { mr = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined); }
+  catch (e) { try { mr = new MediaRecorder(stream); } catch (e2) { mr = null; } }
+  if (!mr) { finish('MediaRecorder 创建失败，这个浏览器内核不支持录音。'); return; }
+
+  const parts = [];
+  mr.ondataavailable = (e) => { if (e && e.data && e.data.size) parts.push(e.data); };
+  let stopped = false;
+  try { mr.start(250); } catch (e) { finish('MediaRecorder.start 失败：' + e.message); return; }
+  add('录音中', '请现在说话…（3 秒）', 'warn');
+
+  const buf = analyser ? new Float32Array(1024) : null;
+  const t0 = Date.now();
+  const tick = setInterval(() => {
+    if (!analyser || !buf) return;
+    try {
+      analyser.getFloatTimeDomainData(buf);
+      let s = 0;
+      for (let i = 0; i < buf.length; i++) s += buf[i] * buf[i];
+      const rms = Math.sqrt(s / buf.length);
+      if (rms > 0) frames++;
+      if (rms > maxRms) maxRms = rms;
+    } catch (e) {}
+  }, 100);
+
+  await sleep(3000);
+  clearInterval(tick);
+  if (!stopped) { stopped = true; await new Promise(r => { mr.onstop = r; try { mr.stop(); } catch (e) { r(); } }); }
+  try { stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+
+  const blob = new Blob(parts, { type: mime || 'audio/webm' });
+  const secs = ((Date.now() - t0) / 1000).toFixed(1);
+  add('录音结果', blob.size + ' 字节 · ' + parts.length + ' 个分片 · ' + secs + 's · ' + (mime || '默认编码'),
+      blob.size > 800 ? 'ok' : 'bad');
+  add('音量检测', frames > 0 ? '收到 ' + frames + ' 帧 · 峰值 RMS=' + maxRms.toFixed(4) : '一帧都没收到（RMS=0）',
+      frames > 0 && maxRms > 0.01 ? 'ok' : 'bad');
+
+  if (blob.size < 800) {
+    finish('麦克风拿到了，但录出来是空的 —— 这是「点了允许却没声音」的典型现象。'
+      + '请确认没开静音、没被其他 App 占用麦克风，然后重试。');
+    return;
+  }
+
+  add('上传中', '原生格式 voice.' + extOf(mime), 'warn');
+  const r1 = await post(blob, 'voice.' + extOf(mime));
+  add('转写 HTTP', String(r1.status), r1.status === 200 ? 'ok' : 'bad');
+  add('返回内容', r1.body || '（空）');
+
+  if (r1.status !== 200) {
+    add('转 WAV 重试', '服务端不接受 ' + extOf(mime) + '，解码后重传', 'warn');
+    try {
+      const c2 = new AC();
+      const ab = await blob.arrayBuffer();
+      const dec = await c2.decodeAudioData(ab);
+      const ch = dec.getChannelData(0);
+      const ratio = dec.sampleRate / 16000;
+      const len = Math.floor(ch.length / ratio);
+      const out16 = new Float32Array(len);
+      for (let i = 0; i < len; i++) {
+        const p = i * ratio, i0 = Math.floor(p), i1 = Math.min(i0 + 1, ch.length - 1), f = p - i0;
+        out16[i] = ch[i0] * (1 - f) + ch[i1] * f;
+      }
+      const r2 = await post(encodeWav(out16, 16000), 'voice.wav');
+      add('WAV 重传 HTTP', String(r2.status), r2.status === 200 ? 'ok' : 'bad');
+      add('WAV 返回内容', r2.body || '（空）');
+      try { c2.close(); } catch (e) {}
+    } catch (e) {
+      add('WAV 重传', '失败：' + ((e && e.message) || e), 'bad');
+    }
+  }
+
+  let conclusion;
+  if (frames === 0 && blob.size > 800) {
+    conclusion = '录音有内容（' + blob.size + ' 字节）但音量检测收不到帧 —— AudioContext 音频图没跑起来，'
+      + '这正是之前「听不到」的原因。好消息：录音本身是好的，应用里会提示你手动点「立即爆炸」。';
+  } else if (r1.status === 200 && /"text":"\S/.test(r1.body)) {
+    conclusion = '全链路通了。应用里应该能正常识别，去试试。';
+  } else if (r1.status === 200) {
+    conclusion = '上传成功但没识别出文字 —— 可能说话声太小或环境太吵，请离近点大声说再测一次。';
+  } else {
+    conclusion = '上传失败（HTTP ' + r1.status + '）。看上面「返回内容」里的错误信息，把它发给我。';
+  }
+  finish(conclusion);
+}
+
+function finish(msg) {
+  const note = document.getElementById('note');
+  note.textContent = msg;
+  note.classList.remove('hidden');
+  const btn = document.getElementById('go');
+  btn.disabled = false;
+  btn.textContent = '再测一次';
+  const raw = document.getElementById('raw');
+  raw.value = R.map(r => r.k + ': ' + r.v).join('\n') + '\n\n结论: ' + msg;
+  raw.classList.remove('hidden');
+  document.getElementById('copy').classList.remove('hidden');
+}
+
+document.getElementById('go').onclick = function () {
+  this.disabled = true;
+  this.textContent = '诊断中…';
+  R.length = 0;
+  out.innerHTML = '';
+  document.getElementById('note').classList.add('hidden');
+  document.getElementById('raw').classList.add('hidden');
+  document.getElementById('copy').classList.add('hidden');
+  let p;
+  try { p = navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }); }
+  catch (e) { p = Promise.reject(e); }
+  p.catch(() => {});
+  run(p);
+};
+
+document.getElementById('copy').onclick = function () {
+  const raw = document.getElementById('raw');
+  raw.classList.remove('hidden');
+  raw.select();
+  try { document.execCommand('copy'); this.textContent = '已复制 ✓'; }
+  catch (e) { this.textContent = '请长按上方的文本框手动复制'; }
+};
+</script>
+</body>
+</html>
