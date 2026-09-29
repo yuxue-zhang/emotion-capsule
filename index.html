@@ -2858,9 +2858,13 @@ async function _runRecordASRCharge(cs, liquid, pLabel, cracks) {
       msg = '转写失败：' + e.message.slice(0, 70);
     } else if (e && /^ASR 上传失败/.test(e.message)) {
       msg = '转写失败：' + e.message.slice(0, 70);
+    } else if (e && /is not defined/.test(e.message)) {
+      msg = '页面脚本出错：' + e.message.slice(0, 60);
     }
+    // 真实错误一并带上，别再让用户只看到「请检查网络」这种兜底话术
+    const detail = (e && ((e.name ? e.name + ': ' : '') + (e.message || String(e)))) || '未知错误';
     showToast(msg);
-    showFailState(msg);
+    showFailState(msg, detail);
   }
 }
 
@@ -3221,6 +3225,20 @@ function recordVoice(maxSec = 20, opts = {}) {
 }
 
 
+// 识别状态提示。
+// 这个函数早期和 Whisper 本地模型状态绑在一起，删 Whisper 死代码时把「定义」删了，
+// 但调用点（_runRecordASRCharge / recognizeSpeech）留了下来 —— 于是每次转写都抛
+// ReferenceError，被 catch 后一律显示「识别失败，请检查网络后重试」，真正的错误被掩盖。
+// 重新定义为全程判空的版本：元素被爆炸动画覆盖掉时静默跳过，不再打断主流程。
+function updateASRStatusUI(main, sub) {
+  try {
+    const el = document.getElementById('chargeModelStatus');
+    if (el && main) el.textContent = main;
+    const micEl = document.getElementById('chargeMicStatus');
+    if (micEl && sub) micEl.textContent = sub;
+  } catch (e) {}
+}
+
 /* ========== 转写结果处理 ========== */
 async function recognizeSpeech(text) {
   state.captureState = 'recognizing';
@@ -3282,20 +3300,39 @@ async function processRecognizedText(text) {
   showResult(match);
 }
 
-function showFailState(hint) {
+function showFailState(hint, detail) {
   clearInterval(state._gasInterval);
   state.captureState = 'fail';
   const stateEl = document.getElementById('captureState');
   const msg = hint || '没关系，手动装填一样可以';
+  window.__lastErr = detail || '';
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const detailHtml = detail ? `
+      <div style="font-size:11px;color:var(--text3);background:rgba(255,255,255,.04);border-radius:6px;padding:8px;margin:10px 0;word-break:break-all;text-align:left">${esc(detail)}</div>
+      <button class="btn btn-ghost" style="width:100%;font-size:12px" onclick="copyErrDetail()">📋 复制错误详情</button>` : '';
   stateEl.innerHTML = `
     <div style="text-align:center">
       <div style="font-size:40px;margin-bottom:12px">💨😵‍💫</div>
       <div style="font-size:16px;color:var(--text2);margin-bottom:8px">屁太响，没听清</div>
-      <div style="font-size:13px;color:var(--text3);margin-bottom:16px">${msg}</div>
-      <button class="btn btn-primary" style="width:100%" onclick="retryCapture()">🎤 再说一次</button>
+      <div style="font-size:13px;color:var(--text3);margin-bottom:16px">${msg}</div>${detailHtml}
+      <button class="btn btn-primary" style="width:100%;margin-top:10px" onclick="retryCapture()">🎤 再说一次</button>
       <button class="btn btn-secondary" style="margin-top:8px;width:100%" onclick="showManualInput()">✍️ 手动装填</button>
       <button class="btn btn-ghost" style="margin-top:8px;width:100%" onclick="resetToCapture()">返回</button>
     </div>`;
+}
+
+function copyErrDetail() {
+  const t = window.__lastErr || '';
+  if (!t) { showToast('没有错误详情'); return; }
+  const ta = document.createElement('textarea');
+  ta.value = t;
+  ta.style.cssText = 'position:absolute;left:-9999px;top:0';
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta);
+  showToast(ok ? '已复制，粘贴给我就行' : '复制失败，请截图这行小字');
 }
 
 // 失败后直接重新开麦，省掉一次「返回」点击
@@ -5423,7 +5460,12 @@ if (window.DeviceMotionEvent) {
     const delta = Math.abs(acc.x || 0) + Math.abs(acc.y || 0) + Math.abs(acc.z || 0);
     if (delta > shakeThreshold && Date.now() - lastShake > 1500) {
       lastShake = Date.now();
-      startCapture();
+      // 原代码调用的 startCapture() 根本没有定义（摇一下就抛 ReferenceError）。
+      // 摇一摇的意图是快捷进入捕捉页，这里显式落到 resetToCapture()，并加判空保护。
+      if (typeof resetToCapture === 'function') {
+        resetToCapture();
+        showToast('摇一摇 · 进入捕捉页');
+      }
     }
   });
 }
