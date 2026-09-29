@@ -2606,8 +2606,10 @@ function startChargeHold() {
   // 所以在 pointerdown 的同步栈里先把请求发出去，后面 recordVoice 直接复用这个 Promise。
   try {
     if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      // 约束项与已验证通过的自检页保持一致：只开回声消除和降噪，
+      // 不再加 autoGainControl —— 部分内核对三个约束的组合会给出异常音轨
       const sp = navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        audio: { echoCancellation: true, noiseSuppression: true },
       });
       sp.catch(() => {}); // 避免 unhandled rejection，真正的处理在 recordVoice 里
       _chargeState.streamPromise = sp;
@@ -2852,6 +2854,10 @@ async function _runRecordASRCharge(cs, liquid, pLabel, cracks) {
       msg = '麦克风已授权，但收不到声音。请退出重进页面再试一次';
     } else if (e && e.message === 'no-asr-key') {
       msg = '语音识别未配置，可用手动装填';
+    } else if (e && /^ASR HTTP/.test(e.message)) {
+      msg = '转写失败：' + e.message.slice(0, 70);
+    } else if (e && /^ASR 上传失败/.test(e.message)) {
+      msg = '转写失败：' + e.message.slice(0, 70);
     }
     showToast(msg);
     showFailState(msg);
@@ -3123,7 +3129,7 @@ function recordVoice(maxSec = 20, opts = {}) {
       if (opts.streamPromise) return opts.streamPromise;
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.reject(new Error('unsupported'));
       return navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        audio: { echoCancellation: true, noiseSuppression: true },
       });
     };
 
