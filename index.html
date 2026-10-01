@@ -5007,6 +5007,16 @@ function generatePihuaSummary(items, topCat, avgScore, sounds, smells) {
   const translations = items.map(c => c.human);
   const top3Translations = translations.slice(0, 3);
 
+  // 把报告数据挂到 state，分享图片时直接读，不用重新算
+  state._pihuaReportData = {
+    count,
+    topCat,
+    avgScore,
+    sounds,
+    topSmell,
+    top3Translations,
+  };
+
   // Generate the summary text
   let body = '';
 
@@ -5106,13 +5116,277 @@ function copyPihuaReport() {
   }
 }
 
-function sharePihuaReport() {
-  const el = document.getElementById('_pihuaReport');
-  if (el) {
-    copyToClipboard(el.textContent);
-    showToast('报告已复制，去粘贴分享吧');
-    if (state.settings.vibrate) navigator.vibrate && navigator.vibrate(30);
+function _wrapText(ctx, text, maxWidth) {
+  const chars = String(text).split('');
+  const lines = [];
+  let line = '';
+  for (const ch of chars) {
+    const test = line + ch;
+    if (ctx.measureText(test).width > maxWidth && line) {
+      lines.push(line);
+      line = ch;
+    } else {
+      line = test;
+    }
   }
+  if (line) lines.push(line);
+  return lines;
+}
+
+function _roundRectPath(ctx, x, y, w, h, r) {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.lineTo(x + w - rr, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
+  ctx.lineTo(x + w, y + h - rr);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+  ctx.lineTo(x + rr, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
+  ctx.lineTo(x, y + rr);
+  ctx.quadraticCurveTo(x, y, x + rr, y);
+  ctx.closePath();
+}
+
+function _drawStamp(ctx, x, y, line1, line2) {
+  ctx.save();
+  ctx.strokeStyle = '#F5C518';
+  ctx.lineWidth = 3;
+  ctx.setLineDash([6, 4]);
+  _roundRectPath(ctx, x, y, 140, 72, 8);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#F5C518';
+  ctx.font = 'bold 18px -apple-system, PingFang SC, Microsoft YaHei, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(line1, x + 70, y + 24);
+  ctx.fillText(line2, x + 70, y + 50);
+  ctx.restore();
+}
+
+// 把屁话连篇报告绘制成一张图片，用于分享（复制/保存后粘贴是图片而不是文字）
+function renderPihuaImage() {
+  const d = state._pihuaReportData;
+  if (!d) return null;
+
+  const W = 750, PAD = 50, CARD_W = 650, SCALE = 2;
+  const cvs = document.createElement('canvas');
+  const ctx = cvs.getContext('2d');
+  const fontBase = '-apple-system, PingFang SC, Microsoft YaHei, sans-serif';
+
+  // 先估算高度
+  let y = 0;
+  y += 80;               // 顶部留白
+  y += 70;               // 标题
+  y += 40;               // 副标题
+  y += 60;               // 卡片前留白
+  const cardY = y;
+  y += 80;               // "本周你被迫听了"
+  y += 120;              // count
+  y += 60;               // "句职场屁话"
+  y += 50;               // 分隔线
+  y += 80;               // 最多类型
+  y += 50;               // 分隔线
+  y += 100;              // 平均离谱度
+  y += 50;               // 分隔线
+  if (d.topSmell) y += 90;  // 气味
+  if (d.topSmell) y += 50;  // 分隔线
+  y += 70;               // 金句精选标题
+
+  // 每条金句换行后的高度
+  ctx.font = '26px ' + fontBase;
+  let quotesH = 0;
+  const quoteInfos = (d.top3Translations || []).map((t) => {
+    const lines = _wrapText(ctx, `“${t}”`, CARD_W - 80);
+    const h = lines.length * 40 + 20;
+    quotesH += h;
+    return { lines, h };
+  });
+  y += quotesH;
+  y += 60;               // 卡片底部留白
+  const cardH = y - cardY;
+  y += 80;               // slogan
+  y += 40;               // 品牌/URL
+  y += 50;               // 底部留白
+  const H = y;
+
+  cvs.width = W * SCALE;
+  cvs.height = H * SCALE;
+  ctx.scale(SCALE, SCALE);
+
+  // 背景
+  ctx.fillStyle = '#17171A';
+  ctx.fillRect(0, 0, W, H);
+
+  // 印章
+  _drawStamp(ctx, W - PAD - 150, 60, '已阅', '不予理会');
+
+  // 标题
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#F5C518';
+  ctx.font = 'bold 60px ' + fontBase;
+  ctx.fillText('屁话连篇', W / 2, 150);
+
+  // 副标题
+  ctx.fillStyle = '#8A8A84';
+  ctx.font = '24px ' + fontBase;
+  ctx.fillText('本周职场屁话观察报告', W / 2, 200);
+
+  // 卡片背景
+  ctx.fillStyle = '#242420';
+  _roundRectPath(ctx, PAD, cardY, CARD_W, cardH, 24);
+  ctx.fill();
+
+  // 卡片内容
+  let cy = cardY + 70;
+  ctx.fillStyle = '#E8E6E1';
+  ctx.font = '24px ' + fontBase;
+  ctx.fillText('本周你被迫听了', W / 2, cy);
+
+  cy += 110;
+  ctx.fillStyle = '#F5C518';
+  ctx.font = 'bold 120px ' + fontBase;
+  ctx.fillText(String(d.count), W / 2, cy);
+
+  cy += 60;
+  ctx.fillStyle = '#8A8A84';
+  ctx.font = '24px ' + fontBase;
+  ctx.fillText('句职场屁话', W / 2, cy);
+
+  function divider(yy) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(PAD + 40, yy);
+    ctx.lineTo(W - PAD - 40, yy);
+    ctx.stroke();
+    return yy + 50;
+  }
+
+  cy = divider(cy + 30);
+
+  // 最多类型
+  if (d.topCat) {
+    ctx.fillStyle = '#8A8A84';
+    ctx.font = '22px ' + fontBase;
+    ctx.fillText('最多的类型是', W / 2, cy);
+    cy += 50;
+    ctx.fillStyle = d.topCat.color || '#F5C518';
+    ctx.font = 'bold 42px ' + fontBase;
+    ctx.fillText(`${d.topCat.icon || ''} ${d.topCat.name || ''}`, W / 2, cy);
+    cy += 40;
+  }
+
+  cy = divider(cy + 20);
+
+  // 平均离谱度
+  ctx.fillStyle = '#8A8A84';
+  ctx.font = '22px ' + fontBase;
+  ctx.fillText('平均离谱度', W / 2, cy);
+  cy += 60;
+  const scoreColor = d.avgScore >= 80 ? '#ef4444' : d.avgScore >= 60 ? '#F5C518' : '#5DCAA5';
+  ctx.fillStyle = scoreColor;
+  ctx.font = 'bold 72px ' + fontBase;
+  ctx.fillText(String(d.avgScore), W / 2, cy);
+  cy += 40;
+  const tag = d.avgScore >= 80 ? '重度屁话污染区' : d.avgScore >= 60 ? '中度屁话污染区' : '尚在忍耐范围';
+  ctx.fillStyle = scoreColor;
+  ctx.font = '22px ' + fontBase;
+  ctx.fillText(tag, W / 2, cy);
+  cy += 30;
+
+  cy = divider(cy + 30);
+
+  // 气味
+  if (d.topSmell) {
+    ctx.fillStyle = '#8A8A84';
+    ctx.font = '22px ' + fontBase;
+    ctx.fillText('最常闻到的气味', W / 2, cy);
+    cy += 50;
+    ctx.fillStyle = d.topSmell.smell.color || '#F5C518';
+    ctx.font = 'bold 36px ' + fontBase;
+    ctx.fillText(`${d.topSmell.smell.icon || ''} ${d.topSmell.smell.name || ''} ×${d.topSmell.count}`, W / 2, cy);
+    cy += 30;
+    cy = divider(cy + 30);
+  }
+
+  // 金句精选
+  ctx.fillStyle = '#F5C518';
+  ctx.font = 'bold 28px ' + fontBase;
+  ctx.fillText('本周金句精选', W / 2, cy);
+  cy += 50;
+  ctx.textAlign = 'left';
+  ctx.font = '26px ' + fontBase;
+  ctx.fillStyle = '#E8E6E1';
+  const leftX = PAD + 40;
+  quoteInfos.forEach((info, idx) => {
+    info.lines.forEach((line, i) => {
+      ctx.fillText(line, leftX, cy + i * 40);
+    });
+    cy += info.h;
+  });
+
+  // 底部 slogan
+  cy = cardY + cardH + 70;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#E8E6E1';
+  ctx.font = '26px ' + fontBase;
+  ctx.fillText('屁话终将被装进胶囊', W / 2, cy);
+  ctx.fillText('坏情绪终将被狠狠砸碎', W / 2, cy + 40);
+
+  // 品牌角标
+  ctx.fillStyle = '#8A8A84';
+  ctx.font = '20px ' + fontBase;
+  ctx.fillText('情绪胶囊机 · emotion-capsule.app.workbuddy.host', W / 2, H - 35);
+
+  return cvs.toDataURL('image/png');
+}
+
+function _closePihuaModal() {
+  const m = document.getElementById('_pihuaImgModal');
+  if (m) m.remove();
+}
+
+function showPihuaImageModal(dataURL) {
+  _closePihuaModal();
+  const modal = document.createElement('div');
+  modal.id = '_pihuaImgModal';
+  modal.style.cssText = 'position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,0.92);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:16px;overflow:auto';
+  modal.innerHTML = `
+    <div style="color:#F5C518;font-size:16px;font-weight:600;margin-bottom:10px;text-align:center">长按图片保存 / 转发</div>
+    <img src="${dataURL}" style="max-width:100%;max-height:70vh;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.5)">
+    <div style="color:#8A8A84;font-size:13px;margin-top:10px;text-align:center">保存到相册后，发朋友圈/微信粘贴就是图片</div>
+    <button id="_pihuaImgClose" style="margin-top:16px;padding:12px 28px;border:none;border-radius:24px;background:#F5C518;color:#17171A;font-size:15px;font-weight:600">关闭</button>`;
+  document.body.appendChild(modal);
+  document.getElementById('_pihuaImgClose').onclick = _closePihuaModal;
+  modal.onclick = (e) => { if (e.target === modal) _closePihuaModal(); };
+}
+
+async function sharePihuaReport() {
+  const d = state._pihuaReportData;
+  if (!d) {
+    showToast('暂无报告数据');
+    return;
+  }
+  const dataURL = renderPihuaImage();
+  if (!dataURL) { showToast('生成图片失败'); return; }
+
+  // 优先尝试写入剪贴板，移动端 App 内支持度不一；失败就弹窗让用户长按保存
+  let copied = false;
+  try {
+    const res = await fetch(dataURL);
+    const blob = await res.blob();
+    if (navigator.clipboard && navigator.clipboard.write) {
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+      copied = true;
+      showToast('图片已复制，去粘贴分享吧');
+    }
+  } catch (e) {}
+
+  showPihuaImageModal(dataURL);
+  if (!copied && state.settings.vibrate) navigator.vibrate && navigator.vibrate(30);
 }
 
 function setFilter(cat) {
