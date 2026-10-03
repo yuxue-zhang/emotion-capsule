@@ -1,4 +1,4 @@
-# 情绪胶囊机 · Emotion Capsule Machine
+# 硬件创新赛道——情绪胶囊机 · Emotion Capsule Machine
 
 **把屁话装进胶囊，把坏情绪砸成惊喜。**
 ## 为什么做这件事
